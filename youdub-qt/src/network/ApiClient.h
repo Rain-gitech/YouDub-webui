@@ -6,6 +6,7 @@
 #include <QObject>
 #include <QString>
 #include <functional>
+#include <utility>
 
 namespace youdub {
 
@@ -59,6 +60,10 @@ public:
     QNetworkReply *rawRequest(Method method, const QString &path,
                               const QByteArray &body = QByteArray(),
                               const char *contentType = "application/json");
+
+    // 无 body 的 GET/DELETE，便捷重载。
+    void get(const QString &path, JsonCallback cb) { requestJson(Method::Get, path, {}, std::move(cb)); }
+    void del(const QString &path, JsonCallback cb) { requestJson(Method::Delete, path, {}, std::move(cb)); }
 
     QNetworkAccessManager *nam() { return &nam_; }
 

@@ -45,6 +45,12 @@ qt_add_executable(youdub-qt WIN32
     src/network/ApiClient.h
     src/network/AuthManager.cpp
     src/network/AuthManager.h
+    src/models/TaskTypes.cpp
+    src/models/TaskTypes.h
+    src/models/TaskListModel.cpp
+    src/models/TaskListModel.h
+    src/viewmodels/TaskListVm.cpp
+    src/viewmodels/TaskListVm.h
     main.cpp
 )
 
@@ -58,6 +64,7 @@ qt_add_qml_module(youdub-qt
         qml/pages/Home.qml
         qml/components/StatusBadge.qml
         qml/components/Separator.qml
+        qml/components/TaskListItem.qml
     RESOURCES
         qml/assets/youdub-icon.svg
 )
