@@ -1,0 +1,19 @@
+# Qt / CMake 构建产物
+build/
+build-*/
+.cache/
+
+# Qt Creator / VS Code
+*.user
+*.user.*
+CMakeUserPresets.json
+.vscode/
+
+# 编译器 / 系统垃圾
+*.obj
+*.o
+*.exe
+*.dll
+*.pdb
+*.ilk
+node_modules/
