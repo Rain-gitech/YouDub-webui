@@ -49,8 +49,12 @@ qt_add_executable(youdub-qt WIN32
     src/models/TaskTypes.h
     src/models/TaskListModel.cpp
     src/models/TaskListModel.h
+    src/models/StageModel.cpp
+    src/models/StageModel.h
     src/viewmodels/TaskListVm.cpp
     src/viewmodels/TaskListVm.h
+    src/viewmodels/TaskDetailVm.cpp
+    src/viewmodels/TaskDetailVm.h
     main.cpp
 )
 
@@ -62,6 +66,7 @@ qt_add_qml_module(youdub-qt
         qml/Theme.qml
         qml/pages/Login.qml
         qml/pages/Home.qml
+        qml/pages/TaskDetail.qml
         qml/components/StatusBadge.qml
         qml/components/Separator.qml
         qml/components/TaskListItem.qml

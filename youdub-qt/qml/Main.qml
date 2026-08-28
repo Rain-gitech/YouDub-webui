@@ -12,7 +12,6 @@ ApplicationWindow {
     visible: true
     title: qsTr("YouDub")
 
-    // 柔和渐变背景（近似 WebUI）。
     background: Rectangle {
         anchors.fill: parent
         gradient: Gradient {
@@ -23,7 +22,6 @@ ApplicationWindow {
         }
     }
 
-    // 启动时探测会话。
     Component.onCompleted: AuthManager.checkSession()
 
     StackView {
@@ -32,18 +30,38 @@ ApplicationWindow {
         initialItem: AuthManager.authenticated ? homeComponent : loginComponent
     }
 
-    // 认证状态变化时切换根页面。
     Connections {
         target: AuthManager
         function onAuthenticatedChanged() {
             if (AuthManager.authenticated) {
-                stack.replace(homeComponent)
+                stack.clear();
+                stack.replace(homeComponent);
             } else {
-                stack.replace(loginComponent)
+                stack.clear();
+                stack.replace(loginComponent);
             }
         }
     }
 
-    Component { id: loginComponent; Login {} }
-    Component { id: homeComponent; Home {} }
+    Component {
+        id: loginComponent
+        Login {}
+    }
+
+    Component {
+        id: homeComponent
+        Home {
+            onOpenTaskRequested: function(taskId) {
+                stack.push(detailComponent, { taskId: taskId });
+            }
+        }
+    }
+
+    Component {
+        id: detailComponent
+        TaskDetail {
+            onBackRequested: stack.pop()
+            onDeletedRequested: stack.pop()
+        }
+    }
 }
