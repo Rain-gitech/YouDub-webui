@@ -33,7 +33,6 @@ import {
 } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { ScrollArea } from "@/components/ui/scroll-area"
 import {
   Select,
   SelectContent,
@@ -527,7 +526,12 @@ export default function Home() {
                 {hasTaskFilters ? t.home.noMatchingTasks : t.home.empty}
               </div>
             ) : (
-              <ScrollArea className="max-h-[56dvh] overflow-hidden">
+              <div
+                role="region"
+                aria-label={t.home.taskHistory}
+                tabIndex={0}
+                className="max-h-[56dvh] overflow-y-auto"
+              >
                 <ul className="flex flex-col">
                   {tasks.map((item) => (
                     <li key={item.id} className="border-b border-border/60 last:border-b-0">
@@ -555,7 +559,7 @@ export default function Home() {
                     </li>
                   ))}
                 </ul>
-              </ScrollArea>
+              </div>
             )}
 
             {taskTotal > 0 ? (

@@ -54,6 +54,7 @@ ApplicationWindow {
             onOpenTaskRequested: function(taskId) {
                 stack.push(detailComponent, { taskId: taskId });
             }
+            onOpenSettingsRequested: stack.push(settingsComponent)
         }
     }
 
@@ -62,6 +63,13 @@ ApplicationWindow {
         TaskDetail {
             onBackRequested: stack.pop()
             onDeletedRequested: stack.pop()
+        }
+    }
+
+    Component {
+        id: settingsComponent
+        Settings {
+            onBackRequested: stack.pop()
         }
     }
 }

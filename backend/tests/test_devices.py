@@ -97,13 +97,12 @@ def test_component_override_takes_precedence(monkeypatch):
     assert resolution.setting_name == "DEMUCS_DEVICE"
 
 
-def test_voxcpm_is_reported_as_unmanaged(monkeypatch):
+def test_voxcpm_uses_managed_device_selection(monkeypatch):
     monkeypatch.setattr(devices, "default_device", lambda: "cuda")
 
     resolution = devices.resolve_device("voxcpm")
-    assert not resolution.managed
-    assert resolution.selected == "library-auto"
-    assert "upstream package" in resolution.reason
+    assert resolution.managed
+    assert resolution.selected == "cuda"
 
 
 def test_validate_device_available_rejects_mps_index(monkeypatch):

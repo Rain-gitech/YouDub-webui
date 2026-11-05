@@ -33,6 +33,7 @@ import { useI18n } from "@/lib/i18n"
 import { statusBadgeClass } from "@/lib/status"
 import { SerialPollingContext, useSerialPolling } from "@/lib/use-serial-polling"
 import { AppHeader } from "@/components/app-header"
+import { PublicationCard } from "@/components/publication-card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -81,7 +82,7 @@ function durationOf(start: string | null, end: string | null) {
 }
 
 function normalizeProgress(value: number | null | undefined) {
-  if (typeof value !== "number") return null
+  if (typeof value !== "number" || !Number.isFinite(value)) return null
   return Math.max(0, Math.min(100, Math.round(value)))
 }
 
@@ -215,8 +216,10 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
 
   const progress = useMemo(() => {
     if (!task?.stages?.length) return 0
-    const completed = task.stages.filter((stage) => stage.status === "succeeded").length
-    return Math.round((completed / task.stages.length) * 100)
+    const completed = task.stages.reduce((sum, stage) => (
+      sum + (stage.status === "succeeded" ? 100 : stage.status === "running" ? normalizeProgress(stage.progress) ?? 0 : 0)
+    ), 0)
+    return Math.round(completed / task.stages.length)
   }, [task])
 
   if (error && !task) {
@@ -243,7 +246,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
               <CardTitle>{t.task.overview}</CardTitle>
               <Badge className={statusBadgeClass(task?.status)}>{statusLabel(task?.status)}</Badge>
             </div>
-            <Progress value={progress} />
+            <Progress value={progress} aria-label={t.task.overview} />
           </CardHeader>
           <CardContent>
             {task ? (
@@ -308,6 +311,8 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
           </Card>
         ) : null}
 
+        {task?.session_path ? <PublicationCard key={task.id} taskId={task.id} /> : null}
+
         <Card>
           <CardHeader>
             <CardTitle>{t.task.stages}</CardTitle>
@@ -365,7 +370,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                         </p>
                         {stage.status === "running" && stageProgress !== null ? (
                           <div className="mt-2 flex items-center gap-3">
-                            <Progress value={stageProgress} className="min-w-0 flex-1" />
+                            <Progress value={stageProgress} aria-label={stageLabel(stage.name, stage.label)} className="min-w-0 flex-1" />
                             <span className="w-10 text-right text-xs tabular-nums text-muted-foreground">
                               {stageProgress}%
                             </span>

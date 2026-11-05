@@ -1,9 +1,11 @@
 import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
+import QtMultimedia
+import QtQuick.Dialogs
 import YouDub
 
-// 任务详情页。阶段进度 + 日志 + 动作。
+// 任务详情页。阶段进度 + 日志 + 动作 + 最终视频回放/下载。
 Page {
     id: page
     background: Item {}
@@ -11,6 +13,9 @@ Page {
     property string taskId: ""
     signal backRequested()
     signal deletedRequested()
+
+    // 视频回放本地 URL（由 videoReady 信号注入）。
+    property string videoUrl: ""
 
     TaskDetailVm {
         id: vm
@@ -178,6 +183,107 @@ Page {
                         }
                     }
                 }
+
+                // 最终视频回放 + 下载
+                Rectangle {
+                    Layout.fillWidth: true
+                    visible: vm.hasFinalVideo
+                    color: Theme.surface
+                    radius: Theme.radiusLg
+                    border.color: Theme.border
+                    border.width: 1
+                    implicitHeight: videoCol.implicitHeight + Theme.spaceLg * 2
+                    ColumnLayout {
+                        id: videoCol
+                        anchors.fill: parent
+                        anchors.margins: Theme.spaceLg
+                        spacing: Theme.spaceMd
+                        Text {
+                            text: qsTr("最终视频")
+                            font.pixelSize: Theme.fontMd
+                            font.bold: true
+                            color: Theme.textPrimary
+                        }
+                        RowLayout {
+                            spacing: Theme.spaceSm
+                            Button {
+                                text: page.videoUrl.length > 0 ? qsTr("重新加载") : qsTr("播放")
+                                enabled: !vm.videoLoading
+                                onClicked: vm.prepareVideo()
+                            }
+                            Button {
+                                text: qsTr("下载另存")
+                                enabled: !vm.videoLoading
+                                onClicked: saveDialog.open()
+                            }
+                            Item { Layout.fillWidth: true }
+                            Button {
+                                text: qsTr("取消")
+                                visible: vm.videoLoading
+                                flat: true
+                                onClicked: vm.cancelVideo()
+                            }
+                        }
+                        ProgressBar {
+                            Layout.fillWidth: true
+                            visible: vm.videoLoading
+                            value: vm.videoProgress
+                        }
+                        Text {
+                            text: vm.videoLoading ? qsTr("下载中 %1%").arg(Math.round(vm.videoProgress * 100)) : ""
+                            color: Theme.textSecondary
+                            font.pixelSize: Theme.fontXs
+                            visible: vm.videoLoading
+                        }
+                        // 播放器
+                        Rectangle {
+                            Layout.fillWidth: true
+                            visible: page.videoUrl.length > 0
+                            height: 320
+                            color: "#000000"
+                            radius: Theme.radiusMd
+                            clip: true
+                            VideoOutput {
+                                id: videoOut
+                                anchors.fill: parent
+                            }
+                            MediaPlayer {
+                                id: player
+                                source: page.videoUrl
+                                videoOutput: videoOut
+                                audioOutput: AudioOutput {}
+                                autoPlay: true
+                            }
+                            // 播放控制条
+                            RowLayout {
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.bottom: parent.bottom
+                                anchors.margins: Theme.spaceSm
+                                spacing: Theme.spaceSm
+                                Button {
+                                    text: player.playing ? qsTr("暂停") : qsTr("播放")
+                                    onClicked: {
+                                        if (player.playing) player.pause()
+                                        else player.play()
+                                    }
+                                }
+                                Slider {
+                                    Layout.fillWidth: true
+                                    from: 0
+                                    to: player.duration > 0 ? player.duration : 1
+                                    value: player.position
+                                    onMoved: player.position = value
+                                }
+                                Text {
+                                    text: formatTime(player.position) + " / " + formatTime(player.duration)
+                                    color: "#ffffff"
+                                    font.pixelSize: Theme.fontXs
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -224,8 +330,29 @@ Page {
         }
     }
 
+    function formatTime(ms) {
+        if (!ms || ms <= 0) return "0:00"
+        const s = Math.floor(ms / 1000)
+        const m = Math.floor(s / 60)
+        const sec = s % 60
+        return m + ":" + (sec < 10 ? "0" : "") + sec
+    }
+
+    // 下载另存对话框
+    FileDialog {
+        id: saveDialog
+        title: qsTr("保存视频")
+        fileMode: FileDialog.SaveFile
+        defaultSuffix: "mp4"
+        currentFile: "youdub-" + (vm.title || page.taskId) + ".mp4"
+        onAccepted: vm.downloadVideo(selectedFile.toString())
+    }
+
     Connections {
         target: vm
         function onDeleted() { page.deletedRequested() }
+        function onVideoReady(localUrl) { page.videoUrl = localUrl }
+        function onVideoDownloaded(path) { /* 另存成功 */ }
+        function onVideoError(message) { /* 错误已在 VM 层，可扩展 toast */ }
     }
 }

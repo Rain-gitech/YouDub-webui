@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import gc
 import json
+import logging
+import os
+import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +18,26 @@ from .runtime_checks import validate_runtime_device
 from .sources import detect_source
 from .stages import STAGES
 from .youtube import is_local_upload_url
+
+logger = logging.getLogger(__name__)
+
+
+def _release_stage_model(stage: str) -> None:
+    if os.getenv("RELEASE_MODELS_AFTER_STAGE", "false").lower() != "true":
+        return
+    if stage not in {"separate", "asr", "tts"}:
+        return
+    module_name = {
+        "asr": "backend.app.adapters.whisper_asr",
+        "tts": "backend.app.adapters.voxcpm",
+    }.get(stage)
+    module = sys.modules.get(module_name) if module_name else None
+    if module is not None:
+        module._MODEL = None
+    gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 @dataclass
@@ -145,9 +169,7 @@ class PipelineRunner:
         now = monotonic()
         previous = self._progress_state.get(stage)
         if previous and not force and bounded < 100:
-            last_progress, last_at = previous
-            if bounded <= last_progress:
-                return
+            _, last_at = previous
             if now - last_at < 2:
                 return
         database.update_stage(self.task_id, stage, progress=bounded, last_message=message)
@@ -203,7 +225,13 @@ class PipelineRunner:
             error_message=None,
         )
         self.stage_message(stage, "Started")
-        self._stage_handlers[stage](database.get_task(self.task_id))
+        try:
+            self._stage_handlers[stage](database.get_task(self.task_id))
+        finally:
+            try:
+                _release_stage_model(stage)
+            except Exception:
+                logger.warning("Model cleanup failed after stage %s", stage, exc_info=True)
         database.update_stage(
             self.task_id,
             stage,
@@ -269,7 +297,10 @@ class PipelineRunner:
             from .adapters.ytdlp import download_video
 
             proxy_port = database.get_ytdlp_settings()["proxy_port"]
-            session, info = download_video(task["url"], WORKFOLDER, source, proxy_port)
+            session, info = download_video(
+                task["url"], WORKFOLDER, source, proxy_port,
+                progress_callback=lambda progress, message: self.stage_progress("download", progress, message),
+            )
         self.artifacts.session = session
         self.artifacts.video_file = session / "media" / "video_source.mp4"
         title = (info.get("title") or "").strip() or None
@@ -308,7 +339,10 @@ class PipelineRunner:
 
         vocals_file = _require(self.artifacts.vocals_file, "vocals_file")
         source = detect_source(task["url"])
-        self.artifacts.asr_file = recognize_speech(vocals_file, session, language=source.asr_language)
+        self.artifacts.asr_file = recognize_speech(
+            vocals_file, session, language=source.asr_language,
+            progress_callback=lambda progress, message: self.stage_progress("asr", progress, message),
+        )
         data = _json.loads(self.artifacts.asr_file.read_text(encoding="utf-8"))
         utterances = data["result"]["utterances"]
         word_count = sum(len(u.get("words") or []) for u in utterances)
@@ -356,6 +390,7 @@ class PipelineRunner:
         import json as _json
 
         session = _require(self.artifacts.session, "session")
+        self._prepare_publication(session)
         source = detect_source(task["url"])
         subtitle_file = self._uploaded_subtitle_path(task)
         if subtitle_file:
@@ -394,6 +429,18 @@ class PipelineRunner:
         preprocess_file = preprocess_artifact_path(session)
         if preprocess_file.exists():
             self.log(f"[translate] Preprocess artifact -> {preprocess_file}")
+
+    def _prepare_publication(self, session: Path) -> None:
+        # Publication metadata can be retried independently without reprocessing video.
+        from .adapters.publication import generate_publication
+
+        if any((session / "metadata" / name).exists() for name in ("ytdlp_info.json", "local_info.json")):
+            try:
+                generate_publication(session, database.get_openai_settings())
+                self.log("[publication] Chinese title and description saved")
+            except Exception:
+                self.log("[publication] Chinese publishing copy could not be generated; retry from task details")
+                logger.exception("Publication metadata generation failed for %s", self.task_id)
 
     def _split_audio(self, _: dict) -> None:
         from .adapters.audio import split_audio_by_translation
@@ -438,7 +485,10 @@ class PipelineRunner:
         dubbing_file = _require(self.artifacts.dubbing_file, "dubbing_file")
         bgm_file = _require(self.artifacts.bgm_file, "bgm_file")
         timings_file = _require(self.artifacts.timings_file, "timings_file")
-        self.artifacts.final_video = merge_video(video_file, dubbing_file, bgm_file, timings_file, session)
+        self.artifacts.final_video = merge_video(
+            video_file, dubbing_file, bgm_file, timings_file, session,
+            progress_callback=lambda percent, message: self.stage_progress("merge_video", percent, message),
+        )
         size_mb = self.artifacts.final_video.stat().st_size / (1024 * 1024)
         self.stage_message("merge_video", f"Final video: {self.artifacts.final_video} ({size_mb:.1f} MB)")
 

@@ -58,7 +58,7 @@ def _stretch_segment(audio_file: Path, ratio: float, target_sec: float, cache_di
     if abs(ratio - 1.0) < SPEED_NOOP_EPSILON:
         y, sr = librosa.load(str(audio_file), sr=None)
         return y, sr
-    from audiostretchy.stretch import stretch_audio
+    from audiostretchy import stretch_audio
 
     out_path = cache_dir / audio_file.name
     stretch_audio(str(audio_file), str(out_path), ratio=ratio)

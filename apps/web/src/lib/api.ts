@@ -116,6 +116,23 @@ export type Task = {
   stages: TaskStage[]
 }
 
+export type Publication = {
+  title_zh: string
+  description_zh: string
+  source_title: string
+  source_description: string
+  source_url: string
+  uploader: string
+}
+
+export function getPublication(id: string, signal?: AbortSignal) {
+  return request<{ publication: Publication | null }>(`/api/tasks/${encodeURIComponent(id)}/publication`, { signal })
+}
+
+export function generatePublication(id: string) {
+  return request<{ publication: Publication }>(`/api/tasks/${encodeURIComponent(id)}/publication`, { method: "POST" })
+}
+
 export type CookieInfo = {
   exists: boolean
   size: number

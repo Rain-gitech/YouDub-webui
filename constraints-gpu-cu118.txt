@@ -1,0 +1,8 @@
+# Local GTX 1660 Ti runtime: keep the CUDA stack matched during dependency install.
+# Install the CUDA wheels first, then use this file with pip -c.
+torch==2.7.1+cu118
+torchaudio==2.7.1+cu118
+voxcpm==2.0.3
+transformers==5.15.1
+numpy>=1.26,<2.4
+audiostretchy==1.3.14

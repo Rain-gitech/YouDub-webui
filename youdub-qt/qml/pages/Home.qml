@@ -1,16 +1,18 @@
 import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
+import QtQuick.Dialogs
 import YouDub
 
-// 首页：任务创建表单 + 任务历史列表。
-// 阶段2：URL 创建 + 列表/分页/过滤/排序/轮询。本地上传留到阶段4。
+// 首页：任务创建表单（URL + 本地上传）+ 任务历史列表。
+// 对齐 apps/web/src/app/page.tsx：URL 创建、本地视频+字幕上传、方向选择、进度。
 Page {
     id: page
     background: Item {}
 
     // 供 Main 注入导航回调（阶段3接入详情页）。
     signal openTaskRequested(string taskId)
+    signal openSettingsRequested()
 
     TaskListVm {
         id: vm
@@ -39,6 +41,11 @@ Page {
                     color: Theme.textPrimary
                 }
                 Item { Layout.fillWidth: true }
+                Button {
+                    text: qsTr("设置")
+                    flat: true
+                    onClicked: page.openSettingsRequested()
+                }
                 Button {
                     text: qsTr("退出登录")
                     flat: true
@@ -75,18 +82,18 @@ Page {
                             placeholderText: qsTr("YouTube 或 Bilibili 链接")
                             font.pixelSize: Theme.fontSm
                             onAccepted: submit()
-                            enabled: !vm.creating
+                            enabled: !vm.creating && !vm.uploading && videoPath.text.length === 0
                         }
                         ComboBox {
                             id: modeCombo
                             model: [ { key: "auto", label: qsTr("自动") }, { key: "manual", label: qsTr("手动") } ]
                             textRole: "label"
                             valueRole: "key"
-                            enabled: !vm.creating
+                            enabled: !vm.creating && !vm.uploading
                         }
                         Button {
                             text: vm.creating ? qsTr("创建中…") : qsTr("创建")
-                            enabled: !vm.creating && urlField.text.trim().length > 0
+                            enabled: !vm.creating && !vm.uploading && urlField.text.trim().length > 0
                             onClicked: submit()
                             contentItem: Text {
                                 text: parent.text
@@ -99,6 +106,92 @@ Page {
                                 radius: Theme.radiusSm
                             }
                         }
+                    }
+
+                    // 分隔
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.topMargin: Theme.spaceXs
+                        Layout.bottomMargin: Theme.spaceXs
+                        height: 1
+                        color: Theme.borderMuted
+                    }
+
+                    // 本地上传
+                    Text {
+                        text: qsTr("本地上传")
+                        font.pixelSize: Theme.fontMd
+                        font.bold: true
+                        color: Theme.textPrimary
+                    }
+                    RowLayout {
+                        spacing: Theme.spaceSm
+                        Button {
+                            text: qsTr("选择视频")
+                            enabled: !vm.uploading && urlField.text.trim().length === 0
+                            onClicked: videoDialog.open()
+                        }
+                        Text {
+                            id: videoPath
+                            Layout.fillWidth: true
+                            text: ""
+                            color: Theme.textSecondary
+                            font.pixelSize: Theme.fontXs
+                            elide: Text.ElideMiddle
+                            visible: text.length > 0
+                        }
+                        ComboBox {
+                            id: directionCombo
+                            model: [ { key: "en-zh", label: qsTr("英→中") }, { key: "zh-en", label: qsTr("中→英") } ]
+                            textRole: "label"
+                            valueRole: "key"
+                            enabled: !vm.uploading && videoPath.text.length > 0
+                        }
+                    }
+                    RowLayout {
+                        spacing: Theme.spaceSm
+                        Button {
+                            text: qsTr("选择字幕")
+                            enabled: !vm.uploading && videoPath.text.length > 0
+                            onClicked: subtitleDialog.open()
+                        }
+                        Text {
+                            id: subtitlePath
+                            Layout.fillWidth: true
+                            text: ""
+                            color: Theme.textSecondary
+                            font.pixelSize: Theme.fontXs
+                            elide: Text.ElideMiddle
+                            visible: text.length > 0
+                        }
+                        Item { Layout.fillWidth: true }
+                        Button {
+                            text: vm.uploading ? qsTr("上传中…") : qsTr("上传")
+                            enabled: !vm.uploading && videoPath.text.length > 0
+                            onClicked: upload()
+                            contentItem: Text {
+                                text: parent.text
+                                color: "white"
+                                font.pixelSize: Theme.fontSm
+                                horizontalAlignment: Text.AlignHCenter
+                            }
+                            background: Rectangle {
+                                color: parent.enabled ? (parent.down ? Theme.primaryHover : Theme.primary) : "#cbd5e1"
+                                radius: Theme.radiusSm
+                            }
+                        }
+                    }
+                    // 上传进度
+                    ProgressBar {
+                        Layout.fillWidth: true
+                        visible: vm.uploading
+                        value: vm.uploadProgress
+                    }
+                    Text {
+                        text: vm.uploading ? qsTr("已上传 %1%").arg(Math.round(vm.uploadProgress * 100)) : ""
+                        color: Theme.textSecondary
+                        font.pixelSize: Theme.fontXs
+                        visible: vm.uploading
                     }
                     Text {
                         text: vm.errorMessage
@@ -217,9 +310,44 @@ Page {
         urlField.text = ""
     }
 
+    function upload() {
+        if (videoPath.text.length === 0) return
+        vm.uploadLocal(videoPath.text, subtitlePath.text,
+                       directionCombo.currentValue, modeCombo.currentValue)
+    }
+
+    function clearLocalSelection() {
+        videoPath.text = ""
+        subtitlePath.text = ""
+    }
+
+    // 视频选择对话框
+    FileDialog {
+        id: videoDialog
+        title: qsTr("选择视频文件")
+        fileMode: FileDialog.OpenFile
+        nameFilters: [ qsTr("视频文件 (*.mp4 *.mov *.m4v *.mkv *.webm *.avi *.flv *.wmv)"), qsTr("所有文件 (*)") ]
+        onAccepted: {
+            subtitlePath.text = ""
+            videoPath.text = selectedFile.toString()
+        }
+    }
+
+    // 字幕选择对话框
+    FileDialog {
+        id: subtitleDialog
+        title: qsTr("选择字幕文件")
+        fileMode: FileDialog.OpenFile
+        nameFilters: [ qsTr("字幕文件 (*.srt)"), qsTr("所有文件 (*)") ]
+        onAccepted: subtitlePath.text = selectedFile.toString()
+    }
+
     // 创建成功后（阶段2）刷新已在 VM 内执行；阶段3接入跳转详情。
     Connections {
         target: vm
-        function onTaskCreated(taskId) { /* 阶段3：openTaskRequested(taskId) */ }
+        function onTaskCreated(taskId) {
+            clearLocalSelection()
+            urlField.text = ""
+        }
     }
 }

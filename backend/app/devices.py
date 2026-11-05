@@ -7,8 +7,8 @@ from .config import device as default_device
 
 
 SUPPORTED_DEVICE_TYPES = {"cpu", "cuda", "mps"}
-MANAGED_COMPONENTS = ("demucs", "whisper")
-PLAN_COMPONENTS = (*MANAGED_COMPONENTS, "voxcpm")
+MANAGED_COMPONENTS = ("demucs", "whisper", "voxcpm")
+PLAN_COMPONENTS = MANAGED_COMPONENTS
 
 CUDA_INSTALL_HINT = (
     "Install a CUDA-enabled PyTorch build before requirements.txt, for example: "
@@ -112,16 +112,6 @@ def _resolve_configured_device(value: str, setting_name: str) -> str:
 def resolve_device(component: str) -> DeviceResolution:
     component_name = component.strip().lower()
     configured, setting_name = _configured_device(component_name)
-
-    if component_name == "voxcpm":
-        return DeviceResolution(
-            component=component_name,
-            configured=configured,
-            selected="library-auto",
-            setting_name=setting_name,
-            managed=False,
-            reason="VoxCPM currently selects cuda, mps, or cpu inside the upstream package.",
-        )
 
     selected = _resolve_configured_device(configured, setting_name)
     selected_type = device_type(selected, setting_name)

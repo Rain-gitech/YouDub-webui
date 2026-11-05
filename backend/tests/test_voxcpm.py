@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import soundfile as sf
+import pytest
 
 from backend.app.adapters import voxcpm as voxcpm_mod
 
@@ -33,6 +34,62 @@ _CACHE_GENERATION_DEFAULTS = {
     "retry_badcase_max_times": 3,
     "retry_badcase_ratio_threshold": 6.0,
 }
+
+
+@patch.object(voxcpm_mod, "_load_model")
+def test_voxcpm15_uses_source_text_with_own_prompt(mock_load, tmp_path, monkeypatch):
+    monkeypatch.setattr(voxcpm_mod, "_MODEL_ARCHITECTURE", "voxcpm", raising=False)
+    session = tmp_path / "session"
+    vocals = session / "segments/vocals"
+    reference = _make_synthetic_wav(vocals / "0001.wav", 2000)
+    translation = _write_translation_json(session / "translation.json", [{"src": "Hello world.", "dst": "你好。"}])
+    model = MagicMock()
+    model.generate.return_value = np.zeros(1600, dtype=np.float32)
+    model.tts_model.sample_rate = 16000
+    mock_load.return_value = model
+
+    voxcpm_mod.generate_tts(translation, vocals, session)
+
+    model.generate.assert_called_once_with(
+        text="你好。", prompt_wav_path=str(reference), prompt_text="Hello world.",
+        cfg_value=2.0, inference_timesteps=10,
+    )
+
+
+@patch.object(voxcpm_mod, "_load_model")
+def test_voxcpm15_fallback_prompt_uses_reference_source_text(mock_load, tmp_path, monkeypatch):
+    monkeypatch.setattr(voxcpm_mod, "_MODEL_ARCHITECTURE", "voxcpm", raising=False)
+    session = tmp_path / "session"
+    vocals = session / "segments/vocals"
+    _make_synthetic_wav(vocals / "0001.wav", 400)
+    reference = _make_synthetic_wav(vocals / "0002.wav", 2000)
+    translation = _write_translation_json(session / "translation.json", [
+        {"src": "Short.", "dst": "短句。"}, {"src": "Long reference.", "dst": "长句。"},
+    ])
+    model = MagicMock()
+    model.generate.return_value = np.zeros(1600, dtype=np.float32)
+    model.tts_model.sample_rate = 16000
+    tensor = MagicMock()
+    tensor.squeeze.return_value.cpu.return_value.numpy.return_value = np.zeros(1600, dtype=np.float32)
+    model.tts_model.generate_with_prompt_cache.return_value = (tensor, None, None)
+    mock_load.return_value = model
+
+    voxcpm_mod.generate_tts(translation, vocals, session)
+
+    model.tts_model.build_prompt_cache.assert_called_once_with(
+        prompt_wav_path=str(reference), prompt_text="Long reference.",
+    )
+
+
+@patch.object(voxcpm_mod, "_load_model")
+def test_voxcpm15_rejects_prompt_without_source_transcript(mock_load, tmp_path, monkeypatch):
+    monkeypatch.setattr(voxcpm_mod, "_MODEL_ARCHITECTURE", "voxcpm", raising=False)
+    session = tmp_path / "session"
+    vocals = session / "segments/vocals"
+    _make_synthetic_wav(vocals / "0001.wav", 2000)
+    translation = _write_translation_json(session / "translation.json", [{"dst": "你好。"}])
+    with pytest.raises(ValueError, match="source transcript"):
+        voxcpm_mod.generate_tts(translation, vocals, session)
 
 
 @patch.object(voxcpm_mod, "_load_model")

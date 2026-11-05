@@ -124,6 +124,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-gpu/
 env/
 venv/
 ENV/
@@ -181,6 +182,7 @@ env.txt
 apps/web/.next/
 apps/web/out/
 apps/web/node_modules/
+apps/web/CLAUDE.md
 apps/web/.env*
 !apps/web/.env.example
 
@@ -189,3 +191,7 @@ backend/.pytest_cache/
 backend/.mypy_cache/
 examples/
 backup/
+
+# Generated Qt build diagnostics and translation binaries
+youdub-qt/link_direct_output.txt
+youdub-qt/translations/*.qm

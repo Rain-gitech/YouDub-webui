@@ -63,6 +63,28 @@ afterEach(() => {
 })
 
 describe("任务详情轮询", () => {
+  it("同步下载速度并把当前阶段的部分进度计入总进度", async () => {
+    const task = taskWithStatus("running")
+    task.stages[0] = {
+      ...task.stages[0], status: "running", progress: 40,
+      last_message: "Downloading · 200.0 MiB / 500.0 MiB · 188.0 KiB/s · Current file ETA 31:17",
+    }
+    task.stages.push({ ...task.stages[0], name: "separate", label: "Demucs", status: "pending", progress: null, last_message: null })
+    mocks.fetch.mockImplementation(async (input) => (
+      String(input).endsWith("/log") ? new Response("") : jsonResponse(task)
+    ))
+    vi.stubGlobal("fetch", mocks.fetch)
+    const params = Promise.resolve({ id: "task-race" })
+    await act(async () => {
+      render(<LanguageProvider><Suspense fallback="loading"><TaskDetailPage params={params} /></Suspense></LanguageProvider>)
+      await params
+    })
+    await waitFor(() => expect(screen.getByText(/188.0 KiB\/s/)).toBeInTheDocument())
+    const bars = screen.getAllByRole("progressbar")
+    expect(bars[0]).toHaveAttribute("aria-valuenow", "20")
+    expect(bars[1]).toHaveAttribute("aria-valuenow", "40")
+  })
+
   it("continue 返回新状态后不会被动作前的迟到轮询覆盖", async () => {
     let resolveOldPoll!: (response: Response) => void
     const oldPoll = new Promise<Response>((resolve) => {

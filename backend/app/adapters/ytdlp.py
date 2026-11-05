@@ -2,18 +2,123 @@ from __future__ import annotations
 
 import json
 import os
+import math
+import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import time
 
 import requests
 import yt_dlp
+from yt_dlp.postprocessor import PostProcessor
 
 from .. import runtime_security
 from ..sanitize import sanitize_text
 from ..sources import SourceConfig
 from ..youtube import extract_video_id, validate_video_url
+
+logger = logging.getLogger(__name__)
+ProgressCallback = Callable[[int, str], None]
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return max(0, float(value))
+    return None
+
+
+def _bytes_label(value: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
+
+
+def _eta_label(value: float) -> str:
+    seconds = int(value)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+
+
+class DownloadProgress:
+    """Account for separate video/audio streams without completing before merge."""
+
+    def __init__(self, callback: ProgressCallback):
+        self.callback = callback
+        self.streams: dict[str, dict[str, float | None]] = {}
+        self.progress = 0
+
+    def seed_formats(self, info: dict[str, Any]) -> None:
+        for fmt in info.get("requested_formats") or [info]:
+            key = str(fmt.get("format_id") or "media")
+            self.streams.setdefault(key, {
+                "total": _number(fmt.get("filesize")) or _number(fmt.get("filesize_approx")),
+                "downloaded": 0.0,
+            })
+
+    def _emit(self, progress: int, message: str) -> None:
+        self.progress = progress
+        try:
+            self.callback(progress, message)
+        except Exception:
+            # A progress-store failure must not delete an in-flight download.
+            logger.warning("Unable to publish download progress", exc_info=True)
+
+    def download(self, event: dict[str, Any]) -> None:
+        status = event.get("status")
+        if status not in {"downloading", "finished"}:
+            return
+        info = event.get("info_dict") or {}
+        if info.get("requested_formats"):
+            self.seed_formats(info)
+        key = str(info.get("format_id") or event.get("filename") or "media")
+        stream = self.streams.setdefault(key, {"total": None, "downloaded": 0.0})
+        observed_bytes = _number(event.get("downloaded_bytes"))
+        downloaded = observed_bytes or 0.0
+        total = _number(event.get("total_bytes")) or _number(event.get("total_bytes_estimate"))
+        if total:
+            stream["total"] = total
+        if status == "finished":
+            if observed_bytes is None:
+                downloaded = stream["total"] or 0
+            stream["total"] = downloaded or stream["total"]
+        stream["downloaded"] = downloaded
+        done = sum(item["downloaded"] or 0 for item in self.streams.values())
+        known = all(item["total"] for item in self.streams.values())
+        overall_total = sum(item["total"] or 0 for item in self.streams.values())
+        percent = min(99, int(done / overall_total * 100)) if known and overall_total else 0
+        message = "Downloading" if status == "downloading" else "Stream downloaded; preparing next stream or merge"
+        size = f"{_bytes_label(done)} / {_bytes_label(overall_total)}" if known else f"{_bytes_label(done)}; total unknown"
+        parts = [message, size]
+        speed = _number(event.get("speed"))
+        eta = _number(event.get("eta"))
+        if status == "downloading" and speed is not None:
+            parts.append(f"{_bytes_label(speed)}/s")
+        if status == "downloading" and eta is not None:
+            parts.append(f"Current file ETA {_eta_label(eta)}")
+        self._emit(percent, " · ".join(parts))
+
+    def postprocess(self, event: dict[str, Any]) -> None:
+        if event.get("postprocessor") == "DownloadProgressSeed":
+            return
+        if event.get("status") not in {"started", "processing", "finished"}:
+            return
+        message = "Merging audio and video" if event.get("postprocessor") == "Merger" else "Finalizing downloaded files"
+        self._emit(99, message)
+
+
+class DownloadProgressSeedPP(PostProcessor):
+    def __init__(self, reporter: DownloadProgress):
+        super().__init__()
+        self.reporter = reporter
+
+    def run(self, info: dict[str, Any]):
+        # yt-dlp removes requested_formats from the later per-stream hooks.
+        self.reporter.seed_formats(info)
+        return [], info
 
 
 FORMAT_CANDIDATES = (
@@ -103,10 +208,12 @@ def _remove_partial_outputs(video_file: Path) -> None:
 
 
 def _download_with_format_candidates(
-    url: str, video_file: Path, source: SourceConfig, proxy_port: str
+    url: str, video_file: Path, source: SourceConfig, proxy_port: str,
+    progress_callback: ProgressCallback | None = None,
 ) -> None:
     last_error: Exception | None = None
     for format_selector in FORMAT_CANDIDATES:
+        reporter = DownloadProgress(progress_callback) if progress_callback else None
         download_opts = {
             **_ydl_base(source, proxy_port),
             "format": format_selector,
@@ -115,8 +222,13 @@ def _download_with_format_candidates(
             "retries": 10,
             "fragment_retries": 10,
         }
+        if reporter:
+            download_opts["progress_hooks"] = [reporter.download]
+            download_opts["postprocessor_hooks"] = [reporter.postprocess]
         try:
             with yt_dlp.YoutubeDL(download_opts) as ydl:
+                if reporter:
+                    ydl.add_post_processor(DownloadProgressSeedPP(reporter), when="before_dl")
                 ydl.download([url])
             return
         except Exception as exc:
@@ -129,7 +241,8 @@ def _download_with_format_candidates(
 
 
 def download_video(
-    url: str, workfolder: Path, source: SourceConfig, proxy_port: str = ""
+    url: str, workfolder: Path, source: SourceConfig, proxy_port: str = "",
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     validated = validate_video_url(url)
     if validated.source != source.name:
@@ -137,6 +250,8 @@ def download_video(
     canonical_url = validated.url
     video_id = validated.video_id
     _ensure_cookie(source)
+    if progress_callback:
+        progress_callback(0, "Reading video information")
     info_opts = _ydl_base(source, proxy_port)
     with yt_dlp.YoutubeDL(info_opts) as ydl:
         info = ydl.extract_info(canonical_url, download=False)
@@ -157,7 +272,7 @@ def download_video(
     if video_file.exists() and video_file.stat().st_size > 0:
         return session, info
 
-    _download_with_format_candidates(canonical_url, video_file, source, proxy_port)
+    _download_with_format_candidates(canonical_url, video_file, source, proxy_port, progress_callback)
 
     if not video_file.exists() or video_file.stat().st_size == 0:
         raise RuntimeError("yt-dlp finished without producing media/video_source.mp4")

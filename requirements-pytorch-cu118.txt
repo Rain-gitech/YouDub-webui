@@ -1,0 +1,4 @@
+# Matched CUDA wheels for the local GTX 1660 Ti and older CUDA 11.x driver.
+--index-url https://download.pytorch.org/whl/cu118
+torch==2.7.1+cu118
+torchaudio==2.7.1+cu118

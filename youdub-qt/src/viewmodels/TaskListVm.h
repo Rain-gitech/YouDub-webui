@@ -8,6 +8,8 @@
 #include "TaskListModel.h"
 #include "ApiClient.h"
 
+namespace youdub { class MultipartUpload; }
+
 namespace youdub {
 
 class AuthManager;
@@ -28,6 +30,8 @@ class TaskListVm : public QObject {
     Q_PROPERTY(QString sort READ sort WRITE setSort NOTIFY sortChanged)
     Q_PROPERTY(QString errorMessage READ errorMessage NOTIFY errorMessageChanged)
     Q_PROPERTY(bool creating READ creating NOTIFY creatingChanged)
+    Q_PROPERTY(bool uploading READ uploading NOTIFY uploadingChanged)
+    Q_PROPERTY(double uploadProgress READ uploadProgress NOTIFY uploadProgressChanged)
 public:
     explicit TaskListVm(QObject *parent = nullptr);
 
@@ -53,9 +57,15 @@ public:
     void setSort(const QString &s);
     QString errorMessage() const { return errorMessage_; }
     bool creating() const { return creating_; }
+    bool uploading() const { return uploading_; }
+    double uploadProgress() const { return uploadProgress_; }
 
     // 创建 YouTube/Bilibili URL 任务。成功发 taskCreated(id)。
     Q_INVOKABLE void createTask(const QString &url, const QString &executionMode = "auto");
+
+    // 上传本地视频（+可选字幕）。direction: "en-zh"|"zh-en"。
+    Q_INVOKABLE void uploadLocal(const QString &videoPath, const QString &subtitlePath,
+                                 const QString &direction, const QString &executionMode);
 
     // 立即刷新一次（过滤变化时调用）。
     Q_INVOKABLE void refreshNow();
@@ -76,6 +86,8 @@ signals:
     void errorMessageChanged();
     void creatingChanged();
     void authManagerChanged();
+    void uploadingChanged();
+    void uploadProgressChanged();
     void taskCreated(const QString &taskId);
 
 private:
@@ -83,6 +95,8 @@ private:
     void resetPage();
     void setError(const QString &msg);
     void setCreating(bool v);
+    void setUploading(bool v);
+    void setUploadProgress(double p);
     ApiClient *api();
 
     AuthManager *auth_{nullptr};
@@ -98,6 +112,8 @@ private:
     QString sort_{QStringLiteral("created_desc")};
     QString errorMessage_;
     bool creating_{false};
+    bool uploading_{false};
+    double uploadProgress_{0.0};
     bool polling_{false};
 };
 

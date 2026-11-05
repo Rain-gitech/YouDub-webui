@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
+from time import monotonic
+from types import FunctionType, SimpleNamespace
+from typing import Callable
 from urllib.parse import urlparse
 
 from pydub import AudioSegment
@@ -10,6 +14,48 @@ from pydub import AudioSegment
 from ..devices import resolve_device
 
 _MODEL = None
+logger = logging.getLogger(__name__)
+
+
+def _transcribe_with_progress(model, audio: str, language: str, callback=None):
+    options = {"language": language, "word_timestamps": True, "verbose": False}
+    method = model.transcribe
+    function = getattr(method, "__func__", None)
+    source = function.__globals__.get("tqdm") if isinstance(function, FunctionType) else None
+    if callback is None or source is None:
+        return method(audio, **options)
+
+    class FrameProgress(source.tqdm):
+        def __init__(self, *args, **kwargs):
+            self._started = monotonic()
+            super().__init__(*args, **kwargs)
+
+        def update(self, amount=1):
+            result = super().update(amount)
+            if not self.total:
+                return result
+            current = max(0, min(self.n, self.total)) / 100
+            total = self.total / 100
+            elapsed = max(monotonic() - self._started, 0.001)
+            speed = current / elapsed
+            message = f"Recognizing speech · {current:.1f} / {total:.1f} s audio · {speed:.2f}x realtime"
+            if speed > 0:
+                seconds = int(max(0, total - current) / speed)
+                minutes, seconds = divmod(seconds, 60)
+                message += f" · ETA {minutes:02d}:{seconds:02d}"
+            try:
+                callback(min(99, int(current / total * 100)), message)
+            except Exception:
+                logger.warning("Unable to publish recognition progress", exc_info=True)
+            return result
+
+    # Whisper exposes a frame counter through tqdm, but no public progress
+    # callback. Give just this invocation its own globals mapping: the installed
+    # module, model method and shared tqdm package remain untouched.
+    namespace = {**function.__globals__, "tqdm": SimpleNamespace(tqdm=FrameProgress)}
+    observe = FunctionType(function.__code__, namespace, function.__name__, function.__defaults__, function.__closure__)
+    observe.__kwdefaults__ = function.__kwdefaults__
+    return observe(model, audio, **options)
 
 
 def _whisper_cache_file(whisper, name: str, download_root: str | None) -> Path | None:
@@ -45,15 +91,22 @@ def _load_model():
 
     name = os.getenv("WHISPER_MODEL", "large-v3-turbo")
     whisper_device = resolve_device("whisper").selected
+    # Whisper otherwise retains the CUDA checkpoint while copying a second set
+    # of model weights to CUDA, which can exhaust a 6GB GPU during loading.
+    load_device = "cpu" if whisper_device.startswith("cuda") else whisper_device
     download_root = os.getenv("WHISPER_DOWNLOAD_ROOT") or None
     try:
-        _MODEL = whisper.load_model(name, device=whisper_device, download_root=download_root)
+        model = whisper.load_model(name, device=load_device, download_root=download_root)
     except RuntimeError as exc:
         if not _is_checksum_error(exc):
             raise
         if not _remove_corrupt_whisper_cache(whisper, name, download_root):
             raise
-        _MODEL = whisper.load_model(name, device=whisper_device, download_root=download_root)
+        model = whisper.load_model(name, device=load_device, download_root=download_root)
+
+    if load_device != whisper_device:
+        model = model.to(whisper_device)
+    _MODEL = model
 
     return _MODEL
 
@@ -85,20 +138,22 @@ def _convert_segments(segments: list) -> list:
     ]
 
 
-def recognize_speech(vocals_file: Path, session: Path, language: str) -> Path:
+def recognize_speech(
+    vocals_file: Path, session: Path, language: str,
+    progress_callback: Callable[[int, str], None] | None = None,
+) -> Path:
     metadata_dir = session / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
     output_file = metadata_dir / "asr.json"
     if output_file.exists():
         return output_file
 
+    if progress_callback:
+        progress_callback(0, "Loading speech recognition model")
     model = _load_model()
-    result = model.transcribe(
-        str(vocals_file),
-        language=language,
-        word_timestamps=True,
-        verbose=False,
-    )
+    if progress_callback:
+        progress_callback(0, "Preparing audio for recognition")
+    result = _transcribe_with_progress(model, str(vocals_file), language, progress_callback)
 
     utterances = _convert_segments(result.get("segments", []))
     if not utterances:

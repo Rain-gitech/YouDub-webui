@@ -66,36 +66,82 @@ def _client(base_url: str, api_key: str) -> OpenAI:
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
+_QUOTE_PAIRS = (('"', '"'), ("'", "'"), ("“", "”"), ("「", "」"))
 
-def _extract_json(raw: str) -> dict[str, Any]:
+
+def _clean_fallback_text(raw: str) -> str:
+    """Best-effort cleanup of a plain-text reply used as a translation fallback."""
+    cleaned = raw.strip()
+    for open_q, close_q in _QUOTE_PAIRS:
+        if (
+            len(cleaned) >= 2
+            and cleaned.startswith(open_q)
+            and cleaned.endswith(close_q)
+        ):
+            inner = cleaned[1:-1].strip()
+            if inner:
+                cleaned = inner
+                break
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[A-Za-z]*\s*", "", cleaned)
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+    return cleaned
+
+
+def _extract_json(raw: str, *, fallback_dst: bool = False) -> dict[str, Any]:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
     match = _JSON_BLOCK_RE.search(raw)
-    if not match:
-        raise json.JSONDecodeError(f"no JSON object found; raw[:300]={raw[:300]!r}", raw, 0)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            raise json.JSONDecodeError(
+                f"{exc.msg}; len={len(raw)}; raw[:300]={raw[:300]!r}; raw[-200:]={raw[-200:]!r}",
+                raw,
+                exc.pos,
+            ) from None
+    if fallback_dst:
+        cleaned = _clean_fallback_text(raw)
+        if cleaned:
+            return {"dst": cleaned}
+    raise json.JSONDecodeError(f"no JSON object found; raw[:300]={raw[:300]!r}", raw, 0)
+
+
+def _create_completion(client: OpenAI, model: str, system: str, user: str):
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
     try:
-        return json.loads(match.group(0))
-    except json.JSONDecodeError as exc:
-        raise json.JSONDecodeError(
-            f"{exc.msg}; len={len(raw)}; raw[:300]={raw[:300]!r}; raw[-200:]={raw[-200:]!r}",
-            raw,
-            exc.pos,
-        ) from None
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:
+        # Some OpenAI-compatible providers (e.g. local servers, some models) do
+        # not support response_format. Retry without it so the task can proceed.
+        log.warning(
+            "Chat completion with response_format=json_object failed (%s); retrying without it",
+            exc,
+        )
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.2,
+        )
 
 
-def _call_json(client: OpenAI, model: str, system: str, user: str) -> dict[str, Any]:
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.2,
-    )
+def _call_json(client: OpenAI, model: str, system: str, user: str, *, fallback_dst: bool = False) -> dict[str, Any]:
+    response = _create_completion(client, model, system, user)
     raw = response.choices[0].message.content or "{}"
-    return _extract_json(raw)
+    return _extract_json(raw, fallback_dst=fallback_dst)
 
 
 def _format_terms(items: list, fmt: str, empty: str) -> str:
@@ -170,7 +216,7 @@ def translate_sentence(
     last_error: Exception | None = None
     for attempt in range(TRANSLATE_RETRY):
         try:
-            data = _call_json(client, model, system, text)
+            data = _call_json(client, model, system, text, fallback_dst=True)
             item = TranslationItem.model_validate(data)
             if not item.dst.strip():
                 raise ValueError("empty dst")

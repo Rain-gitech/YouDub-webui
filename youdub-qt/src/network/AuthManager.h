@@ -24,9 +24,8 @@ class AuthManager : public QObject {
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
     Q_PROPERTY(QString errorMessage READ errorMessage NOTIFY errorMessageChanged)
 public:
+    // parent 缺省为 nullptr，同时充当 QML 单例所需的无参构造。
     explicit AuthManager(QObject *parent = nullptr);
-    // QML 单例需要无参构造（委托给上面的构造）。
-    AuthManager() : AuthManager(nullptr) {}
 
     bool authenticated() const { return authenticated_; }
     bool busy() const { return busy_; }

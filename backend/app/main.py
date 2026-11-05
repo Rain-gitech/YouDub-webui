@@ -127,8 +127,11 @@ async def lifespan(app: FastAPI):
     database.init_db()
     database.delete_expired_auth_sessions(database.now_iso())
     database.backfill_titles_from_metadata()
-    database.fail_stale_active_tasks()
-    worker.start(run_task)
+    # A second API process can serve new UI features without interrupting an
+    # existing GPU worker. It must never reset active task state or start a worker.
+    if os.getenv("YOUDUB_API_ONLY", "false").lower() != "true":
+        database.fail_stale_active_tasks()
+        worker.start(run_task)
     yield
 
 
@@ -621,6 +624,49 @@ def final_video(task_id: str, download: bool = False) -> FileResponse:
         return FileResponse(final_path, media_type="video/mp4", filename=name)
     headers = {"Content-Disposition": f'inline; filename="{name}"'}
     return FileResponse(final_path, media_type="video/mp4", headers=headers)
+
+
+def _publication_session(task_id: str) -> Path:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if not task.get("session_path"):
+        raise HTTPException(status_code=409, detail="Original video metadata is not available yet.")
+    return Path(task["session_path"])
+
+
+@app.get("/api/tasks/{task_id}/publication")
+def get_publication(task_id: str) -> dict:
+    from .adapters.publication import read_publication
+
+    data = read_publication(_publication_session(task_id))
+    return {"publication": data}
+
+
+@app.post("/api/tasks/{task_id}/publication")
+def create_publication(task_id: str) -> dict:
+    from .adapters.publication import generate_publication
+
+    session = _publication_session(task_id)
+    try:
+        return {"publication": generate_publication(session, database.get_openai_settings())}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("Publication translation failed for %s", task_id)
+        raise HTTPException(status_code=502, detail="Publication translation failed. Please retry.")
+
+
+@app.get("/api/tasks/{task_id}/artifact/publication")
+def download_publication(task_id: str) -> PlainTextResponse:
+    from .adapters.publication import publication_text, read_publication
+
+    data = read_publication(_publication_session(task_id))
+    if not data:
+        raise HTTPException(status_code=404, detail="Chinese publication copy is not available yet.")
+    return PlainTextResponse(publication_text(data), headers={
+        "Content-Disposition": 'attachment; filename="publication.zh.txt"',
+    })
 
 
 @app.get("/api/cookies/youtube")

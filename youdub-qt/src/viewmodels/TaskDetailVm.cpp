@@ -1,7 +1,13 @@
 #include "TaskDetailVm.h"
 
+#include <QFile>
+#include <QFileInfo>
+#include <QDir>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QNetworkReply>
+#include <QTemporaryFile>
+#include <QUrl>
 
 #include "AuthManager.h"
 
@@ -171,6 +177,105 @@ void TaskDetailVm::deleteTask() {
             stopPolling();
             emit deleted();
         });
+}
+
+void TaskDetailVm::setVideoLoading(bool v) {
+    if (videoLoading_ == v) return;
+    videoLoading_ = v;
+    emit videoLoadingChanged();
+}
+
+void TaskDetailVm::setVideoProgress(double p) {
+    if (qFuzzyCompare(videoProgress_, p)) return;
+    videoProgress_ = p;
+    emit videoProgressChanged();
+}
+
+// 鉴权 GET 最终视频 artifact，流式写入 file。
+// 对齐后端 GET /api/tasks/{id}/artifact/final-video（cookie 鉴权，支持 Range）。
+void TaskDetailVm::streamVideoArtifact(QFile *file,
+        std::function<void(bool ok, const QString &err)> cb) {
+    auto *client = api();
+    if (!client) { cb(false, tr("未认证。")); return; }
+    if (taskId_.isEmpty()) { cb(false, tr("无任务 ID。")); return; }
+    if (!file->open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        cb(false, tr("无法创建本地文件。"));
+        return;
+    }
+    const QString path = QStringLiteral("/api/tasks/") + taskId_ +
+                         QStringLiteral("/artifact/final-video");
+    // rawRequest 已注入 UserAgent/Cache-Control；GET 不需要 CSRF；cookie 由 nam 的 CookieJar 自动带。
+    QNetworkReply *reply = client->rawRequest(Method::Get, path);
+    videoReply_ = reply;
+
+    QObject::connect(reply, &QIODevice::readyRead, this, [this, reply, file]() {
+        if (file && file->isOpen()) file->write(reply->readAll());
+    });
+    QObject::connect(reply, &QNetworkReply::downloadProgress, this, [this](qint64 sent, qint64 total) {
+        if (total > 0) setVideoProgress(double(sent) / double(total));
+    });
+    QObject::connect(reply, &QNetworkReply::finished, this,
+            [this, reply, file, cb]() {
+        reply->deleteLater();
+        if (videoReply_ == reply) videoReply_ = nullptr;
+        // 写完剩余缓冲。
+        if (file && file->isOpen()) {
+            file->write(reply->readAll());
+            file->flush();
+        }
+        const bool ok = (reply->error() == QNetworkReply::NoError);
+        if (!ok) {
+            const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            file->close();
+            if (status == 401) emit requestOpenList();
+            cb(false, status ? tr("下载失败: %1").arg(status) : tr("网络错误。"));
+        } else {
+            file->close();
+            setVideoProgress(1.0);
+            cb(true, QString{});
+        }
+    });
+}
+
+void TaskDetailVm::prepareVideo() {
+    if (videoLoading_) return;
+    // 清理上一次临时文件。
+    delete tempVideoFile_;
+    tempVideoFile_ = new QTemporaryFile(QDir::tempPath() + QStringLiteral("/youdub-XXXXXX.mp4"), this);
+    setVideoProgress(0.0);
+    setVideoLoading(true);
+    streamVideoArtifact(tempVideoFile_, [this](bool ok, const QString &err) {
+        setVideoLoading(false);
+        if (!ok) {
+            emit videoError(err);
+            return;
+        }
+        // tempVideoFile_ 仍持有句柄；用其文件名构造 file:// URL 交给 MediaPlayer。
+        emit videoReady(QUrl::fromLocalFile(tempVideoFile_->fileName()).toString());
+    });
+}
+
+void TaskDetailVm::downloadVideo(const QString &savePathOrUrl) {
+    if (videoLoading_) return;
+    // 兼容 QML FileDialog 给的 file:/// URL 与本地路径。
+    const QUrl u(savePathOrUrl);
+    const QString localPath = u.isLocalFile() ? u.toLocalFile() : savePathOrUrl;
+    auto *file = new QFile(localPath, this);
+    setVideoProgress(0.0);
+    setVideoLoading(true);
+    streamVideoArtifact(file, [this, file, localPath](bool ok, const QString &err) {
+        setVideoLoading(false);
+        file->deleteLater();
+        if (!ok) {
+            emit videoError(err);
+        } else {
+            emit videoDownloaded(localPath);
+        }
+    });
+}
+
+void TaskDetailVm::cancelVideo() {
+    if (videoReply_) videoReply_->abort();
 }
 
 } // namespace youdub

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -10,8 +11,30 @@ import soundfile as sf
 from pydub import AudioSegment
 
 from ..config import MODEL_CACHE_DIR
+from ..devices import resolve_device
 
 _MODEL = None
+_MODEL_ARCHITECTURE = "voxcpm2"
+
+
+@contextmanager
+def _initialization_dtype():
+    configured = os.getenv("VOXCPM_INIT_DTYPE", "").strip().lower()
+    if not configured:
+        yield
+        return
+    import torch
+
+    if configured not in {"float32", "float16", "bfloat16"}:
+        raise ValueError("VOXCPM_INIT_DTYPE must be float32, float16, or bfloat16.")
+    previous = torch.get_default_dtype()
+    try:
+        # The pipeline has one model worker. Construct directly at checkpoint
+        # precision instead of allocating a full temporary FP32 model first.
+        torch.set_default_dtype(getattr(torch, configured))
+        yield
+    finally:
+        torch.set_default_dtype(previous)
 
 _PROMPT_CACHE_GENERATION_DEFAULTS = {
     "min_len": 2,
@@ -36,14 +59,25 @@ def _model_path() -> Path:
 
 
 def _load_model():
-    global _MODEL
+    global _MODEL, _MODEL_ARCHITECTURE
     if _MODEL is None:
         from voxcpm import VoxCPM
 
-        _MODEL = VoxCPM.from_pretrained(
-            str(_model_path()),
-            load_denoiser=os.getenv("VOXCPM_LOAD_DENOISER", "false").lower() == "true",
+        model_path = _model_path()
+        config_file = model_path / "config.json"
+        architecture = (
+            json.loads(config_file.read_text(encoding="utf-8")).get("architecture", "voxcpm")
+            if config_file.exists() else "voxcpm2"
         )
+        selected_device = resolve_device("voxcpm").selected
+        with _initialization_dtype():
+            _MODEL = VoxCPM.from_pretrained(
+                str(model_path),
+                load_denoiser=os.getenv("VOXCPM_LOAD_DENOISER", "false").lower() == "true",
+                device=selected_device,
+                optimize=os.getenv("VOXCPM_OPTIMIZE", "true").lower() == "true",
+            )
+        _MODEL_ARCHITECTURE = architecture
     return _MODEL
 
 
@@ -93,6 +127,14 @@ def _tts_text(item: dict) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+def _reference_arguments(reference: Path, source_text: str) -> dict[str, str]:
+    if _MODEL_ARCHITECTURE == "voxcpm":
+        if not isinstance(source_text, str) or not source_text.strip():
+            raise ValueError("VoxCPM1.x voice cloning requires the reference source transcript.")
+        return {"prompt_wav_path": str(reference), "prompt_text": source_text}
+    return {"reference_wav_path": str(reference)}
+
+
 def generate_tts(
     translation_file: Path,
     vocals_dir: Path,
@@ -116,6 +158,10 @@ def generate_tts(
     inference_timesteps = int(os.getenv("VOXCPM_INFERENCE_TIMESTEPS", "10"))
 
     fallback_caches = {}
+    source_texts = {
+        vocals_dir / f"{index:04d}.wav": item.get("src", "")
+        for index, item in enumerate(items, start=1)
+    }
 
     for index, item in enumerate(items, start=1):
         output_file = output_dir / f"{index:04d}.wav"
@@ -127,7 +173,7 @@ def generate_tts(
                 if speaker not in fallback_caches:
                     fallback = fallback_references.get(speaker, global_fallback)
                     fallback_caches[speaker] = model.tts_model.build_prompt_cache(
-                        reference_wav_path=str(fallback)
+                        **_reference_arguments(fallback, source_texts.get(fallback, ""))
                     )
                 result = model.tts_model.generate_with_prompt_cache(
                     target_text=text,
@@ -141,7 +187,7 @@ def generate_tts(
             else:
                 wav = model.generate(
                     text=text,
-                    reference_wav_path=str(reference),
+                    **_reference_arguments(reference, item.get("src", "")),
                     cfg_value=cfg_value,
                     inference_timesteps=inference_timesteps,
                 )

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import re
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 from ..config import ffmpeg_binary, ffprobe_binary
 
@@ -247,7 +250,76 @@ def subtitle_filter(video_file: Path, subtitle_file: Path, session: Path) -> str
     return f"subtitles=filename='{sub_path}':force_style='{style}'"
 
 
-def merge_video(video_file: Path, dubbing_file: Path, bgm_file: Path, timings_file: Path, session: Path) -> Path:
+def _positive_number(value: str) -> float | None:
+    try:
+        number = float(value)
+        return number if math.isfinite(number) and number > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+class EncodingProgress:
+    def __init__(self, duration: float | None, callback: Callable[[int, str], None]):
+        self.duration = _positive_number(str(duration))
+        self.callback = callback
+        self.packet: dict[str, str] = {}
+        self.percent = 0
+
+    def line(self, line: str) -> None:
+        key, separator, value = line.strip().partition("=")
+        if not separator:
+            return
+        self.packet[key] = value
+        if key != "progress":
+            return
+        seconds = (_positive_number(self.packet.get("out_time_us", "")) or 0) / 1_000_000
+        message = f"Encoding video · {seconds:.1f}"
+        if self.duration:
+            self.percent = max(self.percent, min(99, int(seconds / self.duration * 100)))
+            message += f" / {self.duration:.1f}"
+        message += " s"
+        fps = _positive_number(self.packet.get("fps", ""))
+        speed = _positive_number(self.packet.get("speed", "").removesuffix("x"))
+        if fps:
+            message += f" · {fps:.1f} fps"
+        if speed:
+            message += f" · {speed:.2f}x realtime"
+            if self.duration:
+                remaining = math.ceil(max(0, self.duration - seconds) / speed)
+                message += f" · ETA {remaining // 60:02d}:{remaining % 60:02d}"
+        try:
+            self.callback(self.percent, message)
+        except Exception:
+            logging.getLogger(__name__).exception("Failed to report encoding progress")
+        self.packet.clear()
+
+
+def run_encoding_with_progress(command: list[str], duration: float | None,
+                               callback: Callable[[int, str], None], cwd: Path) -> None:
+    command = [command[0], "-progress", "pipe:1", "-nostats", *command[1:]]
+    reporter = EncodingProgress(duration, callback)
+    # Inherit stderr so diagnostic output cannot fill an unread pipe.
+    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True,
+                          encoding="utf-8", errors="replace", cwd=cwd) as process:
+        assert process.stdout is not None
+        for line in process.stdout:
+            reporter.line(line)
+        returncode = process.wait()
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, command)
+
+
+def probe_duration(path: Path) -> float | None:
+    result = subprocess.run(
+        [ffprobe_binary(), "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True,
+    )
+    return _positive_number(result.stdout.strip()) if result.returncode == 0 else None
+
+
+def merge_video(video_file: Path, dubbing_file: Path, bgm_file: Path, timings_file: Path, session: Path,
+                progress_callback: Callable[[int, str], None] | None = None) -> Path:
     tmp_dir = session / "tmp"
     media_dir = session / "media"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -264,6 +336,8 @@ def merge_video(video_file: Path, dubbing_file: Path, bgm_file: Path, timings_fi
     mixed_audio = tmp_dir / "audio_mixed.m4a"
     mixed_audio_output = mixed_audio.resolve()
     final_video_output = final_video.resolve()
+    if progress_callback:
+        progress_callback(0, "Mixing narration and background audio")
     subprocess.run(
         [
             ffmpeg_binary(),
@@ -282,8 +356,7 @@ def merge_video(video_file: Path, dubbing_file: Path, bgm_file: Path, timings_fi
         ],
         check=True,
     )
-    subprocess.run(
-        [
+    command = [
             ffmpeg_binary(),
             "-y",
             "-i",
@@ -308,8 +381,12 @@ def merge_video(video_file: Path, dubbing_file: Path, bgm_file: Path, timings_fi
             "+faststart",
             "-shortest",
             str(final_video_output),
-        ],
-        check=True,
-        cwd=session_dir,
-    )
+        ]
+    if progress_callback:
+        durations = [probe_duration(path) for path in (video_input, mixed_audio_output)]
+        known_durations = [duration for duration in durations if duration is not None]
+        duration = min(known_durations) if len(known_durations) == 2 else None
+        run_encoding_with_progress(command, duration, progress_callback, session_dir)
+    else:
+        subprocess.run(command, check=True, cwd=session_dir)
     return final_video

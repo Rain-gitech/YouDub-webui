@@ -5,6 +5,7 @@
 #include <QTimer>
 
 #include "AuthManager.h"
+#include "MultipartUpload.h"
 
 namespace youdub {
 
@@ -138,6 +139,18 @@ void TaskListVm::setCreating(bool v) {
     emit creatingChanged();
 }
 
+void TaskListVm::setUploading(bool v) {
+    if (uploading_ == v) return;
+    uploading_ = v;
+    emit uploadingChanged();
+}
+
+void TaskListVm::setUploadProgress(double p) {
+    if (qFuzzyCompare(uploadProgress_, p)) return;
+    uploadProgress_ = p;
+    emit uploadProgressChanged();
+}
+
 void TaskListVm::setError(const QString &msg) {
     if (errorMessage_ == msg) return;
     errorMessage_ = msg;
@@ -163,6 +176,38 @@ void TaskListVm::createTask(const QString &url, const QString &executionMode) {
             pollOnce();
             if (!id.isEmpty()) emit taskCreated(id);
         });
+}
+
+void TaskListVm::uploadLocal(const QString &videoPath, const QString &subtitlePath,
+                              const QString &direction, const QString &executionMode) {
+    auto *client = api();
+    if (!client) return;
+    if (uploading_) {
+        setError(tr("已有上传任务进行中。"));
+        return;
+    }
+    setError(QString{});
+    setUploading(true);
+    setUploadProgress(0.0);
+
+    // 上传器作为本 VM 的子对象，完成后自删。
+    auto *uploader = new MultipartUpload(client, this);
+    connect(uploader, &MultipartUpload::progress, this, [this](qint64 sent, qint64 total) {
+        if (total > 0) setUploadProgress(double(sent) / double(total));
+    });
+    connect(uploader, &MultipartUpload::finished, this,
+            [this, uploader](const QString &taskId, const QString &error) {
+                setUploading(false);
+                setUploadProgress(0.0);
+                if (!error.isEmpty()) {
+                    setError(error);
+                } else {
+                    pollOnce();
+                    if (!taskId.isEmpty()) emit taskCreated(taskId);
+                }
+                uploader->deleteLater();
+            });
+    uploader->start(videoPath, subtitlePath, direction, executionMode);
 }
 
 } // namespace youdub

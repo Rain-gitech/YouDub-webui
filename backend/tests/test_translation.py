@@ -194,7 +194,7 @@ def test_translate_batch_uses_shared_system_prompt(monkeypatch):
     captured: list[str] = []
     lock = __import__("threading").Lock()
 
-    def fake_call_json(client, model, system, user):
+    def fake_call_json(client, model, system, user, **kwargs):
         with lock:
             captured.append(system)
         return {"dst": f"dst:{user}"}
@@ -219,7 +219,7 @@ def test_concurrency_from_bad_saved_values_falls_back_to_default(value):
 def test_translate_sentence_retries_on_empty_dst(monkeypatch):
     calls = {"n": 0}
 
-    def fake_call_json(client, model, system, user):
+    def fake_call_json(client, model, system, user, **kwargs):
         calls["n"] += 1
         return {"dst": ""} if calls["n"] == 1 else {"dst": "ok"}
 
@@ -231,7 +231,7 @@ def test_translate_sentence_retries_on_empty_dst(monkeypatch):
 
 
 def test_translate_sentence_raises_after_retries(monkeypatch):
-    def fake_call_json(client, model, system, user):
+    def fake_call_json(client, model, system, user, **kwargs):
         raise ValueError("boom")
 
     monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
@@ -268,3 +268,58 @@ def test_translate_system_prompt_contains_meta_summary_hotwords(monkeypatch):
     assert "Long description" in system
     assert "Recap of the talk." in system
     assert "LEGO -> 乐高" in system
+
+
+def test_extract_json_falls_back_to_plain_text_when_requested():
+    out = openai_translate._extract_json(
+        "也许未来的世界并不会真的那么糟糕。", fallback_dst=True
+    )
+    assert out == {"dst": "也许未来的世界并不会真的那么糟糕。"}
+
+
+def test_extract_json_strips_surrounding_quotes_in_fallback():
+    out = openai_translate._extract_json("“你好世界”", fallback_dst=True)
+    assert out == {"dst": "你好世界"}
+
+
+def test_extract_json_does_not_fallback_without_flag():
+    import json as _json
+
+    with pytest.raises(_json.JSONDecodeError):
+        openai_translate._extract_json("也许未来的世界并不会真的那么糟糕。")
+
+
+def test_translate_sentence_accepts_plain_text_reply(monkeypatch):
+    # Reproduce the reported failure: model replies with plain text instead of
+    # {"dst": ...}. The sentence-level fallback must accept it as the translation.
+    choice = type("Choice", (), {"message": type("Msg", (), {"content": "也许未来的世界并不会真的那么糟糕。"})()})()
+    response = type("Response", (), {"choices": [choice]})()
+
+    monkeypatch.setattr(openai_translate, "_create_completion", lambda *a, **kw: response)
+
+    out = openai_translate.translate_sentence(
+        "Maybe the future won't be so bad.", "zh", object(), "m", "sys"
+    )
+    assert out == "也许未来的世界并不会真的那么糟糕。"
+
+
+def test_create_completion_retries_without_response_format(monkeypatch):
+    calls: list[dict] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise Exception("response_format not supported")
+            return "ok"
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    out = openai_translate._create_completion(FakeClient(), "m", "sys", "user")
+    assert out == "ok"
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in calls[1]
