@@ -1,0 +1,189 @@
+/**
+ * Local Service Provider for the subprocess capability seam. Each spawn owns a
+ * platform-selected managed range with the spec's per-stream stdio dispositions.
+ * Normal disposal terminates and joins live ranges; Node's synchronous exit
+ * phase force-stops any ranges the service still owns. It has no config: every
+ * disposition and limit arrives on the spec, so deployment-varying choices
+ * stay with the caller's config (the bash executor's, the LSP host's, …).
+ * @module @deepseek-ai/dsh-subprocess-local
+ */
+
+import { Context } from '@deepseek-ai/cordis'
+import { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+import type {
+  SubprocessHandle,
+  SubprocessSpawnSpec,
+} from '@deepseek-ai/dsh-subprocess'
+import {
+  bindManagedProcess,
+  spawnSubprocess,
+  validateSubprocessSpec,
+} from './spawn.ts'
+import { logSpillFailure, prepareManagedProcessBinding } from './output.ts'
+import type { LocalSubprocessHandle, SpawnInternals } from './spawn.ts'
+import {
+  confirmLinuxManager,
+  LinuxScopeNotStartedError,
+  launchLinuxScope,
+  linuxManagerListener,
+  probeLinuxNative,
+  systemdRunIdentity,
+} from './linux-scope.ts'
+import { LinuxScopeSelector } from './linux-scope-selector.ts'
+import type { LinuxScopeDecision } from './linux-scope-selector.ts'
+import { launchWindowsJob, probeWindowsJob } from './windows-job.ts'
+import { targetEnvironment } from './runner-launch.ts'
+
+
+/**
+ * Local subprocess service: platform-selected managed ranges, Node-shaped stdio
+ * dispositions (raw pipes, inherit, bounded tail-keep collection with spill
+ * files), credential-scrubbed environment, and provider-owned range signalling.
+ * POSIX paths stage TERM before KILL; Windows paths terminate immediately.
+ * JavaScript-observable host exit also performs synchronous final termination.
+ */
+export class LocalSubprocessRuntime extends SubprocessRuntime {
+  /** Live handles retained for normal disposal and synchronous host-exit finalization. */
+  private live = new Set<LocalSubprocessHandle>()
+  /** Caller endpoints retained until close, independently of managed process lifetime. */
+  /** Test hook: process, spill, and platform operations forwarded to spawnSubprocess. */
+  internals: SpawnInternals = {}
+  /** Provider-lifetime latch suppressing repeated weaker-containment warnings. */
+  private fallbackWarningIssued = false
+  /**
+   * Linux native containment decisions. Each probe is a spawnSync that blocks the event loop and forks the
+   * host, so the selector reruns it only after an event invalidates the previous verdict.
+   */
+  private readonly linuxScope = new LinuxScopeSelector({
+    probe: () => probeLinuxNative(),
+    managerListener: () => linuxManagerListener(),
+    confirmManager: () => confirmLinuxManager(),
+    launcherIdentity: () => systemdRunIdentity(),
+  })
+  /** Scope decision of the launch in progress; selectContainmentMode sets it immediately before the launch reads it. */
+  private linuxScopeDecision: Extract<LinuxScopeDecision, { kind: 'scope' }> | undefined
+
+  constructor(ctx: Context) {
+    super(ctx)
+    ctx.effect(() => {
+      const onHostExit = (): void => { this.terminateForHostExit() }
+      process.prependListener('exit', onHostExit)
+      return async () => {
+        await this.disposeManagedProcesses()
+        process.off('exit', onHostExit)
+      }
+    }, 'local subprocess teardown')
+  }
+
+  /** Spill failures reach the plugin logger; the log line is the only trace of why a result has no spill path. */
+  private readonly reportSpillFailure = logSpillFailure(this.ctx.logger, 'subprocess-local')
+
+  private terminateForHostExit(): void {
+    for (const handle of this.live) {
+      try {
+        handle.terminateForHostExit()
+      } catch (_ordinaryRangeTerminationFailed) {
+        // Host exit cannot await or report one target; continue with the rest.
+      }
+    }
+  }
+
+  private async disposeManagedProcesses(): Promise<void> {
+    // Request termination, then await MANAGED-RANGE exit — not just the
+    // direct command's settlement — so even a surviving descendant cannot
+    // outlive the fiber. Keep ownership authoritative while these waits are
+    // pending so a shorter process-level exit bound can still force-kill them.
+    const pending: Promise<unknown>[] = []
+    for (const handle of this.live) {
+      handle.terminate()
+      // Direct result and range observation are independent. Start both so an
+      // unreadable owner cannot hide behind a result that never settles.
+      pending.push(Promise.all([
+        handle.done.catch(() => {}),
+        handle.waitForExit(),
+      ]).then(() => { this.live.delete(handle) }))
+    }
+    const outcomes = await Promise.allSettled(pending)
+    const failures: unknown[] = []
+    for (const outcome of outcomes) {
+      if (outcome.status === 'rejected') failures.push(outcome.reason)
+    }
+    if (failures.length > 0) this.terminateForHostExit()
+    if (failures.length === 1) throw failures[0]
+    if (failures.length > 1) throw new AggregateError(failures, 'local subprocess teardown failed')
+  }
+
+  spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
+    validateSubprocessSpec(spec)
+    const env = targetEnvironment(spec)
+    const containmentMode = this.selectContainmentMode()
+    let handle: LocalSubprocessHandle
+    const internals: SpawnInternals = { ...this.internals, onSpillFailure: this.reportSpillFailure }
+    if (containmentMode === 'fallback') {
+      handle = spawnSubprocess(spec, internals)
+    } else {
+      const binding = prepareManagedProcessBinding(internals)
+      const linuxScope = containmentMode === 'linux-scope' ? this.linuxScopeDecision : undefined
+      const launch = linuxScope === undefined
+        ? launchWindowsJob(spec, env)
+        : launchLinuxScope(spec, env, linuxScope.literalArgv)
+      handle = bindManagedProcess(spec, launch, binding)
+      if (linuxScope !== undefined) this.watchLinuxScopeStart(handle.done, linuxScope.generation)
+    }
+    this.live.add(handle)
+    // Release ownership only once the whole managed range is gone, not at direct-child
+    // settlement — a TERM-trapping helper that outlives the leader must stay
+    // owned so teardown can still escalate it. For the common no-survivor
+    // case waitForExit resolves immediately after settlement.
+    const release = (): Promise<void> =>
+      handle.waitForExit().then(() => { this.live.delete(handle) })
+    void handle.done.then(release, release).catch(() => {})
+    return handle
+  }
+
+  /** Probe again before the next launch when a scope launched under generation never started its target. */
+  private watchLinuxScopeStart(done: Promise<unknown>, generation: number): void {
+    void done.catch((error: unknown) => {
+      if (error instanceof LinuxScopeNotStartedError) this.linuxScope.scopeNotStarted(generation)
+    })
+  }
+
+  private selectContainmentMode(): 'linux-scope' | 'windows-job' | 'fallback' {
+    const platform = this.internals.platform ?? process.platform
+    let fallbackReason: string | undefined
+    if (platform === 'linux') {
+      const decision = this.linuxScope.select()
+      const probe = decision.probe === undefined ? '' : `, probed after ${decision.probe}`
+      this.ctx.logger.debug(`linux native containment: ${decision.kind} (${decision.reason}${probe})`)
+      if (decision.kind === 'scope') {
+        this.linuxScopeDecision = decision
+        return 'linux-scope'
+      }
+      fallbackReason = 'the current user-systemd scope or private bootstrap is unavailable'
+    }
+    if (platform === 'win32') {
+      const available = probeWindowsJob()
+      if (available) return 'windows-job'
+    }
+    this.warnFallback(platform, fallbackReason)
+    return 'fallback'
+  }
+
+  private warnFallback(
+    platform: NodeJS.Platform,
+    selectedReason?: string,
+  ): void {
+    if (this.fallbackWarningIssued) return
+    this.fallbackWarningIssued = true
+    const reason = selectedReason ?? (platform === 'darwin'
+      ? 'macOS has no supported persistent process-range owner'
+      : platform === 'win32'
+        ? 'the Win32 Job runner is unavailable'
+        : `platform ${platform} has no native managed range`)
+    this.ctx.logger.warn(
+      `subprocess-local is using weaker process-tree containment because ${reason}; descendants that escape the process group or direct-parent tree are not guaranteed to terminate or delay waitForExit()`,
+    )
+  }
+}
+
+export default LocalSubprocessRuntime

@@ -1,0 +1,201 @@
+name: 桌面版本发布
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 已合入 main 且通过候选包验收的版本 tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.repository == 'liuzhao1225/YouDub-webui' && (github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: 校验 tag、版本和 main 来源
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          node --input-type=module -e 'import { appVersion, validateReleaseVersion } from "./scripts/release-version.mjs"; validateReleaseVersion(appVersion, process.env.RELEASE_TAG)'
+          release_sha="$(git rev-parse HEAD)"
+          test "$release_sha" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then test "$release_sha" = "$GITHUB_SHA"; fi
+          git merge-base --is-ancestor "$release_sha" origin/main
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$release_sha" >> "$GITHUB_OUTPUT"
+
+  quality:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    outputs:
+      run-id: ${{ steps.accepted.outputs.run-id }}
+    steps:
+      - name: 等待同一 main 提交的候选包验收
+        id: accepted
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          # Candidates are built manually on the exact main commit being released.
+          run_id="$(gh api "repos/$GH_REPO/actions/workflows/harness-development.yml/runs?head_sha=$RELEASE_SHA&event=workflow_dispatch&branch=main" --jq '.workflow_runs[0].id // empty')"
+          if [ -z "$run_id" ]; then
+            echo "::error::此 tag 提交没有 main 候选包验收运行；请在 main 手动运行源码检查并启用 package_desktop。"
+            exit 1
+          fi
+          gh run watch "$run_id" --exit-status --interval 15
+          gh api "repos/$GH_REPO/actions/runs/$run_id" --jq '{head_sha,event,head_branch,conclusion}' > accepted.json
+          jq -e --arg sha "$RELEASE_SHA" '.head_sha == $sha and .event == "workflow_dispatch" and .head_branch == "main" and .conclusion == "success"' accepted.json
+          gh api --paginate --slurp "repos/$GH_REPO/actions/runs/$run_id/artifacts" > artifacts.json
+          if ! jq -e '[.[].artifacts[] | select(.expired == false) | .name] | (index("youdub-macos-unsigned") != null) and (index("youdub-windows-release") != null)' artifacts.json; then
+            echo "::error::同提交验收缺少有效的双平台候选包；请启用 package_desktop 完成构建与安装验收。"
+            exit 1
+          fi
+          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "复用 main 提交 $RELEASE_SHA 的候选包：https://github.com/$GH_REPO/actions/runs/$run_id" >> "$GITHUB_STEP_SUMMARY"
+
+  sign:
+    needs: [validate, quality]
+    runs-on: macos-15
+    timeout-minutes: 60
+    environment: macos-release
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_SHA: ${{ needs.validate.outputs.sha }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: 安装签名脚本依赖
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmmirror.com
+          npm --prefix apps/harness ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmmirror.com
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: youdub-macos-unsigned
+          run-id: ${{ needs.quality.outputs.run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/unsigned
+      - name: 解包已构建应用
+        run: |
+          mkdir -p dist
+          tar -xzf "$RUNNER_TEMP/unsigned/youdub-macos-unsigned.tar.gz" -C dist
+      - name: 签名应用
+        env:
+          YOUDUB_APPLE_CREDENTIALS_DIR: ${{ runner.temp }}/apple-signing
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          env GITHUB_SHA="$RELEASE_SHA" GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$RELEASE_TAG" node scripts/prepare-ci-signing.mjs
+          env GITHUB_SHA="$RELEASE_SHA" GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$RELEASE_TAG" node scripts/sign-mac.mjs dist/YouDub.app --sign-only
+      - name: 验证桌面服务与运行后签名
+        run: |
+          node apps/harness/test/package-smoke.mjs dist/YouDub.app dist/package-smoke-signed
+          codesign --verify --deep --strict --verbose=2 dist/YouDub.app
+      - name: 通过 TCP 访问 Apple 公证票据服务
+        # Hosted runners drop HTTP/3 ticket requests: actions/runner-images#14924.
+        # This rule is confined to this disposable runner; TLS verification stays enabled.
+        run: |
+          echo "block return out quick proto udp from any to any port 443" | sudo pfctl -f -
+          sudo pfctl -E
+      - name: 打包与 Apple 公证
+        env:
+          YOUDUB_APPLE_CREDENTIALS_DIR: ${{ runner.temp }}/apple-signing
+        run: env GITHUB_SHA="$RELEASE_SHA" GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$RELEASE_TAG" node scripts/sign-mac.mjs dist/YouDub.app --package-signed
+      - name: 保留失败的公证包与诊断
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-notary-failure
+          path: |
+            dist/YouDub-*.dmg
+            dist/*notary*.json
+          retention-days: 7
+      - name: 清除签名材料
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/apple-signing"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-release
+          path: |
+            dist/YouDub-*.dmg
+            dist/YouDub-*.dmg.sha256
+            dist/dmg-notary.json
+            dist/package-smoke-signed/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: [validate, quality, sign]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-release
+          path: release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: youdub-windows-release
+          run-id: ${{ needs.quality.outputs.run-id }}
+          github-token: ${{ github.token }}
+          path: release
+      - name: 校验并发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        working-directory: release
+        run: |
+          version="${RELEASE_TAG#v}"
+          for suffix in macOS-arm64.dmg windows-x64.zip windows-x64-Setup.exe; do
+            sha256sum --check "YouDub-$version-$suffix.sha256"
+            cp "YouDub-$version-$suffix" "YouDub-$suffix"
+            sha256sum "YouDub-$suffix" > "YouDub-$suffix.sha256"
+          done
+          sha256sum --check ./YouDub-macOS-arm64.dmg.sha256 ./YouDub-windows-x64.zip.sha256 ./YouDub-windows-x64-Setup.exe.sha256
+          cp "../docs/releases/$RELEASE_TAG.md" notes.md
+          gh release create "$RELEASE_TAG" --verify-tag --draft --title "YouDub $RELEASE_TAG" --notes-file notes.md ./YouDub-*.dmg ./YouDub-*.dmg.sha256 ./YouDub-*.zip ./YouDub-*.zip.sha256 ./YouDub-*.exe ./YouDub-*.exe.sha256
+          mkdir downloaded
+          gh release download "$RELEASE_TAG" --dir downloaded --pattern 'YouDub-*'
+          (cd downloaded && sha256sum --check ./*.sha256)
+          gh release edit "$RELEASE_TAG" --draft=false --latest
+          test "$(gh api repos/$GH_REPO/releases/latest --jq .tag_name)" = "$RELEASE_TAG"

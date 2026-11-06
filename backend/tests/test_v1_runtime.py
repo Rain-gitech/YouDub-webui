@@ -1,0 +1,286 @@
+from __future__ import annotations
+
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from backend.app.v1 import runtime
+
+
+@pytest.fixture(autouse=True)
+def clear_device_cache():
+    from backend.app.accelerators import detect_devices
+    detect_devices.cache_clear()
+    yield
+    detect_devices.cache_clear()
+
+
+def probe_all():
+    return {**runtime.runtime_info(), "capabilities": [
+        runtime.probe_capability(adapter)
+        for adapter in ("whisper", "voxcpm", "demucs", "qwen_forced_aligner")
+    ]}
+
+
+def test_catalogue_does_not_advertise_legacy_models_or_load_them(monkeypatch):
+    monkeypatch.setattr(runtime.importlib.util, "find_spec", lambda name: None)
+    result = probe_all()
+    assert [item["id"] for item in result["devices"]] == ["cpu"]
+    assert {item["adapter"] for item in result["capabilities"]} == {"whisper", "voxcpm", "demucs", "qwen_forced_aligner"}
+    assert all(not item["available"] and item["unavailable_reason"] and not item["models"]
+               for item in result["capabilities"])
+    assert "voxcpm" not in sys.modules
+    assert "whisper" not in sys.modules
+
+
+def test_cuda_catalogue_queries_devices_without_loading_models(monkeypatch):
+    from backend.app import accelerators
+    accelerators.detect_devices.cache_clear()
+    monkeypatch.setattr(accelerators, '_exercise', lambda torch, device: None)
+    monkeypatch.setattr(runtime.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(
+        is_available=lambda: True, device_count=lambda: 2,
+        get_device_name=lambda index: f"Test GPU {index}",
+    )))
+    assert [item["id"] for item in runtime._detect_devices()] == ["cuda:0", "cuda:1", "cpu"]
+    accelerators.detect_devices.cache_clear()
+
+
+@pytest.fixture
+def installed_runtime(monkeypatch, tmp_path):
+    models = tmp_path / "whisper-models"
+    models.mkdir()
+    (models / "tiny.pt").write_bytes(b"metadata-only test checkpoint")
+    (models / "small.en.pt").write_bytes(b"metadata-only English checkpoint")
+    (models / "large-v3.pt").touch()
+    monkeypatch.setenv("YOUDUB_WHISPER_MODELS_DIR", str(models))
+    monkeypatch.setenv("YOUDUB_VOXCPM_MODEL_DIR", str(tmp_path / "VoxCPM2"))
+    monkeypatch.setenv("YOUDUB_DEMUCS_MODELS_DIR", str(tmp_path / "demucs"))
+    monkeypatch.setattr(runtime.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(runtime.importlib.metadata, "version", lambda name: "2.0.3")
+    monkeypatch.setattr(runtime, "PathFinder", SimpleNamespace(find_spec=lambda name, path: object()))
+    monkeypatch.setattr(runtime, "_detect_devices", lambda: [
+        {"id": "cpu", "name": "CPU", "available": True, "unavailable_reason": None},
+        {"id": "cuda:0", "name": "Test GPU", "available": True, "unavailable_reason": None},
+    ])
+    monkeypatch.setattr(runtime, "ffmpeg_binary", lambda: "ffmpeg")
+    monkeypatch.setattr(runtime, "ffprobe_binary", lambda: "ffprobe")
+    monkeypatch.setattr(runtime.shutil, "which", lambda name: f"/test/bin/{name}")
+
+
+def test_real_catalogue_reads_local_metadata_without_model_or_network(installed_runtime, monkeypatch):
+    import socket
+
+    from backend.app.v1 import asr
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Runtime must not load a model, instantiate a provider, or connect to the network")
+
+    monkeypatch.setattr(asr, "run", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setitem(sys.modules, "whisper", SimpleNamespace(load_model=forbidden))
+    result = probe_all()
+    whisper, tts, separation = result["capabilities"][:3]
+    assert whisper["available"] and whisper["unavailable_reason"] is None
+    assert [model["id"] for model in whisper["models"]] == ["tiny", "small.en"]
+    assert whisper["models"][0]["source_languages"] == ["auto", "en", "zh", "ja"]
+    assert whisper["models"][1]["source_languages"] == ["auto", "en"]
+    assert all(model["devices"] == ["cpu", "cuda:0"] for model in whisper["models"])
+    assert not tts["available"] and not separation["available"]
+    assert tts["models"] == separation["models"] == []
+
+
+@pytest.mark.parametrize("missing", ["whisper", "torch", "ffmpeg", "ffprobe", "checkpoint"])
+def test_whisper_is_unavailable_when_a_real_local_prerequisite_is_missing(installed_runtime, monkeypatch, tmp_path, missing):
+    if missing in {"whisper", "torch"}:
+        monkeypatch.setattr(runtime.importlib.util, "find_spec", lambda name: None if name == missing else object())
+    elif missing in {"ffmpeg", "ffprobe"}:
+        monkeypatch.setattr(runtime.shutil, "which", lambda name: None if name == missing else f"/test/bin/{name}")
+    else:
+        monkeypatch.setenv("YOUDUB_WHISPER_MODELS_DIR", str(tmp_path / "missing-models"))
+    capability = probe_all()["capabilities"][0]
+    assert not capability["available"] and capability["unavailable_reason"] and capability["models"] == []
+
+
+def test_whisper_is_ready_without_nltk_or_sentence_resources(installed_runtime, monkeypatch, tmp_path):
+    monkeypatch.setattr(runtime.importlib.util, "find_spec", lambda name: None if name == "nltk" else object())
+    monkeypatch.setitem(sys.modules, "nltk", None)
+    monkeypatch.setenv("YOUDUB_HARNESS_RUNTIME", "1")
+    monkeypatch.setenv("NLTK_DATA", str(tmp_path / "missing-nltk-data"))
+    capability = runtime.probe_capability("whisper")
+    assert capability["available"]
+    assert capability["unavailable_reason"] is None
+
+
+def test_configured_ffmpeg_without_path_ffmpeg_does_not_advertise_whisper(installed_runtime, monkeypatch):
+    monkeypatch.setattr(runtime, "ffmpeg_binary", lambda: "/configured/ffmpeg")
+    monkeypatch.setattr(runtime.shutil, "which", lambda name: None if name == "ffmpeg" else "/test/executable")
+    capability = probe_all()["capabilities"][0]
+    assert not capability["available"]
+    assert "Whisper ASR" in capability["unavailable_reason"]
+    assert "PATH" in capability["unavailable_reason"]
+
+
+@pytest.fixture
+def all_model_assets(installed_runtime, tmp_path):
+    root = tmp_path / "VoxCPM2"
+    root.mkdir()
+    for name in ("config.json", "tokenizer_config.json", "tokenizer.json", "model.safetensors", "audiovae.safetensors"):
+        (root / name).write_bytes(b"metadata-only fixture asset")
+    root = tmp_path / "demucs"
+    root.mkdir()
+    (root / "955717e8-8726e21a.th").write_bytes(b"metadata-only fixture checkpoint")
+
+
+def test_all_capabilities_ready_reads_assets_without_loading_models_or_network(all_model_assets, monkeypatch):
+    import socket
+
+    from backend.app.v1 import separate, tts
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Runtime must only read package and asset metadata")
+
+    monkeypatch.setattr(tts, "run", forbidden)
+    monkeypatch.setattr(separate, "run", forbidden)
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden)
+    monkeypatch.setitem(sys.modules, "voxcpm", SimpleNamespace(VoxCPM=SimpleNamespace(from_pretrained=forbidden)))
+    monkeypatch.setitem(sys.modules, "demucs", SimpleNamespace(load_model=forbidden))
+    result = probe_all()
+    assert all(item["available"] and item["unavailable_reason"] is None for item in result["capabilities"][:3])
+    tts_capability, separation = result["capabilities"][1:3]
+    assert tts_capability["models"] == [{
+        "id": "VoxCPM2", "devices": ["cpu", "cuda:0"], "source_languages": ["en", "zh", "ja"],
+        "target_languages": ["en", "zh", "ja"], "voice_modes": ["source_clone"], "voices": [],
+    }]
+    assert separation["models"] == [{
+        "id": "htdemucs", "devices": ["cpu", "cuda:0"], "source_languages": [], "target_languages": [],
+        "voice_modes": [], "voices": [],
+    }]
+
+
+def test_mps_is_available_for_tts_but_not_whisper_sparse_alignment(all_model_assets, monkeypatch):
+    devices = [{"id": "mps", "available": True}, {"id": "cpu", "available": True}]
+    monkeypatch.setattr(runtime, "_detect_devices", lambda: devices)
+    assert runtime.probe_capability('whisper')['models'][0]['devices'] == ['cpu']
+    assert runtime.probe_capability('voxcpm')['models'][0]['devices'] == ['mps', 'cpu']
+
+
+@pytest.mark.parametrize("version", ["1.5.0", "2.0.2", "2.0.3rc1", "not-a-version", None])
+def test_voxcpm_requires_distribution_version_with_explicit_device_support(all_model_assets, monkeypatch, version):
+    def installed_version(name):
+        if name == "transformers":
+            return "5.16.0"
+        assert name == "voxcpm"
+        if version is None:
+            raise runtime.importlib.metadata.PackageNotFoundError(name)
+        return version
+
+    monkeypatch.setattr(runtime.importlib.metadata, "version", installed_version)
+    result = probe_all()
+    capability = result["capabilities"][1]
+    assert not capability["available"] and capability["models"] == []
+    assert "voxcpm>=2.0.3" in capability["unavailable_reason"]
+    assert result["capabilities"][2]["available"]
+
+
+@pytest.mark.parametrize("missing,capability_index", [
+    ("voxcpm", 1), ("transformers", 1), ("librosa", 1), ("safetensors", 1), ("huggingface_hub", 1),
+    ("torch", 1), ("torchaudio", 1), ("soundfile", 1), ("numpy", 1),
+    ("torch", 2), ("torchaudio", 2), ("soundfile", 2), ("julius", 2), ("dora", 2),
+    ("omegaconf", 2), ("einops", 2), ("openunmix", 2),
+])
+def test_local_capability_requires_its_runtime_dependencies(all_model_assets, monkeypatch, missing, capability_index):
+    monkeypatch.setattr(runtime.importlib.util, "find_spec", lambda name: None if name == missing else object())
+    result = probe_all()
+    capability = result["capabilities"][capability_index]
+    assert not capability["available"] and capability["models"] == []
+    assert missing in capability["unavailable_reason"]
+
+
+@pytest.mark.parametrize("missing", ["ffmpeg", "ffprobe"])
+def test_tts_and_separation_require_media_binaries(all_model_assets, monkeypatch, missing):
+    monkeypatch.setattr(runtime.shutil, "which", lambda name: None if name == missing else f"/test/bin/{name}")
+    result = probe_all()
+    assert all(not item["available"] and "FFmpeg" in item["unavailable_reason"] for item in result["capabilities"][1:3])
+
+
+def test_demucs_uses_childs_vendored_source_path_without_importing_it(all_model_assets, monkeypatch):
+    calls = []
+
+    def locate(name, paths):
+        calls.append((name, paths))
+        return None
+
+    monkeypatch.setattr(runtime, "PathFinder", SimpleNamespace(find_spec=locate))
+    capability = probe_all()["capabilities"][2]
+    assert not capability["available"] and "子模块" in capability["unavailable_reason"]
+    assert calls == [("demucs", [str(runtime.Path(runtime.__file__).resolve().parents[3] / "submodule" / "demucs")])]
+
+
+@pytest.mark.parametrize("relative_path,capability_index", [
+    ("VoxCPM2/tokenizer.json", 1), ("VoxCPM2/audiovae.safetensors", 1),
+    ("demucs/955717e8-8726e21a.th", 2),
+])
+def test_incomplete_local_assets_are_not_selectable(all_model_assets, tmp_path, relative_path, capability_index):
+    (tmp_path / relative_path).write_bytes(b"")
+    capability = probe_all()["capabilities"][capability_index]
+    assert not capability["available"] and capability["unavailable_reason"] and capability["models"] == []
+
+
+def test_optional_qwen_missing_is_reported_by_its_own_probe(all_model_assets):
+    result = probe_all()
+    qwen = result["capabilities"][-1]
+    assert qwen["capability"] == "subtitle_alignment" and not qwen["available"]
+
+
+def test_qwen_catalogue_uses_metadata_only(all_model_assets, monkeypatch, tmp_path):
+    from backend.app.v1 import forced_alignment
+
+    monkeypatch.setattr(runtime.importlib.metadata, "version", lambda name: "5.17.0" if name == "transformers" else "2.0.3")
+    root = tmp_path / "qwen"
+    root.mkdir()
+    for name in ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        (root / name).write_bytes(b"metadata fixture")
+    monkeypatch.setenv("YOUDUB_FORCED_ALIGNER_MODEL_DIR", str(root))
+    monkeypatch.setattr(forced_alignment, "align", lambda *args, **kwargs: pytest.fail("Runtime must not run alignment"))
+    result = probe_all()
+    qwen = result["capabilities"][-1]
+    assert qwen["available"] and qwen["execution"] == "local"
+    assert qwen["models"] == [{
+        "id": "Qwen3-ForcedAligner-0.6B-hf", "devices": ["cpu", "cuda:0"], "source_languages": [],
+        "target_languages": ["en", "zh"], "voice_modes": [], "voices": [],
+    }]
+    (root / "model.safetensors").write_bytes(b"")
+    result = probe_all()
+    assert not result["capabilities"][-1]["available"]
+
+
+@pytest.mark.parametrize("version", ["5.16.0", "6.0.0", "5.17.0rc1", "bad", None])
+def test_qwen_requires_supported_transformers_without_importing_model(all_model_assets, monkeypatch, version):
+    def installed(name):
+        if name != "transformers":
+            return "2.0.3"
+        if version is None:
+            raise runtime.importlib.metadata.PackageNotFoundError(name)
+        return version
+    monkeypatch.setattr(runtime.importlib.metadata, "version", installed)
+    qwen = probe_all()["capabilities"][-1]
+    assert not qwen["available"] and "transformers>=5.17,<6" in qwen["unavailable_reason"]
+
+
+def test_single_provider_probe_does_not_inspect_unrelated_models(monkeypatch):
+    calls = []
+    monkeypatch.setattr(runtime, "_detect_devices", lambda: [{"id": "cpu", "available": True}])
+    monkeypatch.setattr(runtime, "_whisper_models", lambda devices: calls.append("whisper") or ([], "Missing checkpoint"))
+    for name in ("_voxcpm_models", "_demucs_models", "_subtitle_alignment_models"):
+        monkeypatch.setattr(runtime, name, lambda *args: pytest.fail("unrelated model probe"))
+    assert runtime.probe_capability("whisper")["unavailable_reason"] == "Missing checkpoint"
+    assert calls == ["whisper"]
+
+
+def test_environment_info_does_not_probe_models(monkeypatch):
+    monkeypatch.setattr(runtime, "_detect_devices", lambda: [{"id": "cpu", "available": True}])
+    for name in ("_whisper_models", "_voxcpm_models", "_demucs_models", "_subtitle_alignment_models"):
+        monkeypatch.setattr(runtime, name, lambda *args: pytest.fail("environment info must not probe models"))
+    assert runtime.runtime_info() == {"devices": [{"id": "cpu", "available": True}]}

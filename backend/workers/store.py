@@ -1,0 +1,373 @@
+"""SQLite persistence operations. Scheduling decisions belong to the Node host."""
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+
+from .protocol import WorkerError
+
+SCHEMA_VERSION = 3
+ACTIVE = ("queued", "running", "waiting", "paused", "cancelling")
+TERMINAL = ("cancelled", "succeeded", "failed")
+
+
+def serialized(value):
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+
+class SqliteStore:
+    def __init__(self, root: Path):
+        from backend.app import runtime_security
+        self.root = root.resolve()
+        self.path = self.root / "desktop.sqlite"
+        runtime_security.ensure_private_directory(self.root)
+        runtime_security.secure_sqlite_database_file(self.path)
+        self.migrate()
+
+    @contextmanager
+    def connect(self):
+        conn = sqlite3.connect(self.path, timeout=5)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def migrate(self):
+        with self.connect() as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version == SCHEMA_VERSION:
+                return
+            if version not in {0, 1, 2}:
+                raise WorkerError("UNSUPPORTED_SCHEMA", f"Unsupported desktop database version: {version}")
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if version == 0 and tables:
+                raise WorkerError("UNSUPPORTED_SCHEMA", "An unversioned database with existing tables cannot be migrated.")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("BEGIN IMMEDIATE")
+            if version == 2:
+                active = [dict(row) for row in conn.execute(
+                    "SELECT id,status FROM tasks WHERE status IN ('queued','running','waiting','cancelling')")]
+                if active:
+                    raise WorkerError("MIGRATION_ACTIVE_TASKS", "Active tasks must finish or be explicitly stopped before migration.", active)
+                self._create_workflows(conn)
+                conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                return
+            if version == 1:
+                active = [dict(row) for row in conn.execute(
+                    "SELECT id,status FROM tasks WHERE status IN ('queued','running','waiting','cancelling')")]
+                if active:
+                    raise WorkerError("MIGRATION_ACTIVE_TASKS", "Legacy active tasks must finish or be explicitly stopped before migration.", active)
+                columns = list(conn.execute("PRAGMA table_info(tasks)"))
+                names = [row["name"] for row in columns]
+                definitions = [f'"{row["name"]}" {row["type"]}' + (" PRIMARY KEY" if row["pk"] else "") for row in columns]
+                conn.execute("CREATE TABLE tasks_v2 (" + ",".join(definitions) + ",plugin_json TEXT,plugin_revision INTEGER NOT NULL DEFAULT 0)")
+                quoted = ",".join('"' + name + '"' for name in names)
+                conn.execute(f"INSERT INTO tasks_v2 ({quoted}) SELECT {quoted} FROM tasks")
+                conn.execute("DROP TABLE tasks")
+                conn.execute("ALTER TABLE tasks_v2 RENAME TO tasks")
+                conn.execute("CREATE TABLE settings_v2 (key TEXT PRIMARY KEY NOT NULL,value_json TEXT NOT NULL CHECK(json_valid(value_json)),updated_at TEXT NOT NULL)")
+                conn.execute("INSERT INTO settings_v2 SELECT key,value_json,updated_at FROM settings")
+                conn.execute("DROP TABLE settings")
+                conn.execute("ALTER TABLE settings_v2 RENAME TO settings")
+            else:
+                conn.execute("""CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY NOT NULL, attempt INTEGER, source_name TEXT, source_size_bytes INTEGER,
+                    source_duration_ms INTEGER, input_path TEXT, config_json TEXT, status TEXT, current_stage TEXT,
+                    stage_progress REAL, wait_reason TEXT, status_message TEXT, outputs_json TEXT, stage_context_json TEXT,
+                    error_json TEXT, created_at TEXT, updated_at TEXT, queued_at TEXT, started_at TEXT, finished_at TEXT,
+                    plugin_json TEXT CHECK(plugin_json IS NULL OR json_valid(plugin_json)), plugin_revision INTEGER NOT NULL DEFAULT 0)""")
+                conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY NOT NULL,value_json TEXT NOT NULL CHECK(json_valid(value_json)),updated_at TEXT NOT NULL)")
+            conn.execute("CREATE INDEX idx_tasks_queue ON tasks(status,queued_at,id)")
+            conn.execute("CREATE INDEX idx_tasks_created ON tasks(created_at DESC,id DESC)")
+            self._create_workflows(conn)
+            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _create_workflows(self, conn):
+        conn.execute("""CREATE TABLE workflow_documents (
+            id TEXT PRIMARY KEY NOT NULL, revision INTEGER NOT NULL,
+            document_json TEXT NOT NULL CHECK(json_valid(document_json)),
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+
+    def decode(self, row):
+        if row is None:
+            return None
+        if row["plugin_json"] is not None:
+            task = json.loads(row["plugin_json"])
+            if task.get("revision") != row["plugin_revision"]:
+                raise WorkerError("CORRUPT_TASK", "Task revision differs from its indexed revision.")
+            return task
+        raw = dict(row)
+        config = json.loads(raw.get("config_json") or "{}")
+        context = json.loads(raw.get("stage_context_json") or "{}")
+        previous_outputs = json.loads(raw.get("outputs_json") or "{}")
+        artifacts, outputs, inputs = {}, [], {}
+        task_root = (self.root / "tasks" / raw["id"]).resolve()
+        original = raw.get("input_path")
+        if isinstance(original, str) and original:
+            source = Path(original).resolve()
+            if source.is_relative_to(task_root) and source.is_file():
+                key = f"legacy:{raw['id']}:input"
+                artifacts[key] = {"id": key, "schemaId": "file/v1", "path": source.relative_to(task_root).as_posix(),
+                                  "mimeType": "application/octet-stream", "name": raw["source_name"],
+                                  "size": source.stat().st_size, "metadata": {}, "invocationId": "input"}
+                inputs["video"] = {"id": key, "schemaId": "file/v1"}
+        for name, value in previous_outputs.items():
+            path = context.get("output_paths", {}).get(name)
+            if path:
+                source = (task_root / path).resolve()
+                if not source.is_relative_to(task_root) or not source.is_file():
+                    continue
+                key = f"legacy:{raw['id']}:{name}"
+                artifacts[key] = {"id": key, "schemaId": value["mime_type"] + "/v1", "path": source.relative_to(task_root).as_posix(),
+                                  "mimeType": value["mime_type"], "name": value["file_name"],
+                                  "size": value["size_bytes"], "metadata": {"timeline": value.get("timeline")},
+                                  "invocationId": "legacy"}
+                outputs.append({"id": name, "label": name, "role": name,
+                                "artifact": {"id": key, "schemaId": artifacts[key]["schemaId"]}})
+        return {"id": raw["id"], "revision": 0, "attempt": raw["attempt"], "legacy": True,
+                "rawSnapshot": raw, "status": raw["status"], "sourceName": raw["source_name"],
+                "workflowId": "legacy-v1", "workflowVersion": "unresolved", "config": config,
+                "inputs": inputs, "plan": None, "steps": [], "artifacts": artifacts, "outputs": outputs,
+                "connections": context.get("resolved_connections", []), "credentialRefs": context.get("credential_refs", {}),
+                "externalRequests": {"legacy": {**context["external_operation"], "mayStillRun": True}} if context.get("external_operation", {}).get("may_still_run") else {},
+                "error": json.loads(raw["error_json"]) if raw.get("error_json") else None,
+                "message": raw.get("status_message"), "createdAt": raw["created_at"], "updatedAt": raw["updated_at"],
+                "queuedAt": raw["queued_at"], "startedAt": raw["started_at"], "finishedAt": raw["finished_at"], "nextPollAt": None}
+
+    def _validate(self, task):
+        if not isinstance(task, dict) or not isinstance(task.get("id"), str):
+            raise WorkerError("INVALID_TASK", "Task must have an ID.")
+        if task.get("status") not in ACTIVE + TERMINAL or type(task.get("attempt")) is not int or task["attempt"] < 1:
+            raise WorkerError("INVALID_TASK", "Task status or attempt is invalid.")
+        if (task["status"] in TERMINAL) != bool(task.get("finishedAt")):
+            raise WorkerError("INVALID_TASK", "Task terminal status and finishedAt disagree.")
+        if task["status"] == "failed" and not task.get("error"):
+            raise WorkerError("INVALID_TASK", "A failed task must retain its error.")
+        if task["status"] == "paused":
+            if task.get("nextPollAt") is not None or not any(step.get("status") == "awaiting_review" for step in task.get("steps", [])):
+                raise WorkerError("INVALID_TASK", "A paused task must have at least one node awaiting review and no polling timestamp.")
+
+    def _write(self, conn, task, *, insert=False):
+        self._validate(task)
+        fields = {"id": task["id"], "attempt": task["attempt"], "status": task["status"],
+                  "source_name": task.get("sourceName"), "created_at": task.get("createdAt"),
+                  "updated_at": task.get("updatedAt"), "queued_at": task.get("queuedAt"),
+                  "started_at": task.get("startedAt"), "finished_at": task.get("finishedAt"),
+                  "plugin_revision": task["revision"], "plugin_json": serialized(task)}
+        if insert:
+            conn.execute(f"INSERT INTO tasks ({','.join(fields)}) VALUES ({','.join('?' for _ in fields)})", tuple(fields.values()))
+        else:
+            conn.execute(f"UPDATE tasks SET {','.join(key + '=?' for key in fields if key != 'id')} WHERE id=?",
+                         (*[value for key, value in fields.items() if key != "id"], task["id"]))
+        return task
+
+    def create(self, task):
+        task = {**task, "revision": 1}
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM tasks WHERE id=?", (task["id"],)).fetchone():
+                raise WorkerError("TASK_EXISTS", "A task with this ID already exists.")
+            return self._write(conn, task, insert=True)
+
+    def get(self, id):
+        with self.connect() as conn:
+            task = self.decode(conn.execute("SELECT * FROM tasks WHERE id=?", (id,)).fetchone())
+        if task is None:
+            raise WorkerError("TASK_NOT_FOUND", "Task not found.")
+        return task
+
+    def list(self, limit=20, offset=0, status=None, active=None):
+        if type(limit) is not int or not 1 <= limit <= 10000 or type(offset) is not int or offset < 0:
+            raise WorkerError("INVALID_QUERY", "Invalid task pagination.")
+        if status is not None and active is not None:
+            raise WorkerError("INVALID_QUERY", "Use status or active, not both.")
+        values = []
+        where = ""
+        if status is not None:
+            if status not in ACTIVE + TERMINAL:
+                raise WorkerError("INVALID_QUERY", "Unknown task status.")
+            where, values = " WHERE status=?", [status]
+        elif active is not None:
+            if type(active) is not bool:
+                raise WorkerError("INVALID_QUERY", "active must be boolean.")
+            states = ACTIVE if active else TERMINAL
+            where, values = " WHERE status IN (" + ",".join("?" for _ in states) + ")", list(states)
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM tasks" + where + " ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?", (*values, limit + 1, offset)).fetchall()
+            return {"items": [self.decode(row) for row in rows[:limit]], "limit": limit, "offset": offset, "hasMore": len(rows) > limit}
+
+    def cas(self, id, expectedRevision, task):
+        if task.get("id") != id:
+            raise WorkerError("INVALID_TASK", "Task ID cannot change.")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (id,)).fetchone()
+            if row is None:
+                raise WorkerError("TASK_NOT_FOUND", "Task not found.")
+            if row["plugin_json"] is None:
+                raise WorkerError("LEGACY_READ_ONLY", "Historical tasks require an explicit rerun.")
+            if type(expectedRevision) is not int or row["plugin_revision"] != expectedRevision:
+                raise WorkerError("REVISION_CONFLICT", "Task revision changed.")
+            previous = self.decode(row)
+            for name in ("plan", "config", "inputs", "workflowId", "workflowVersion", "credentialRefs", "connections",
+                         "graphSnapshot", "workflowSource", "nodeRuntimeInputs"):
+                if task.get(name) != previous.get(name):
+                    raise WorkerError("IMMUTABLE_SNAPSHOT", f"Task {name} snapshot cannot change.")
+            return self._write(conn, {**task, "revision": expectedRevision + 1})
+
+    def claim(self, now):
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM tasks WHERE status IN ('running','cancelling') LIMIT 1").fetchone():
+                return None
+            waiting = conn.execute("SELECT * FROM tasks WHERE status='waiting' ORDER BY started_at,queued_at,id LIMIT 1").fetchone()
+            if waiting is not None:
+                task = self.decode(waiting)
+                if task.get("legacy"):
+                    raise WorkerError("LEGACY_ACTIVE_TASK", "A historical waiting task cannot be executed by the plugin runtime.")
+                due = task.get("nextPollAt")
+                if not isinstance(due, str):
+                    raise WorkerError("INVALID_TASK", "Waiting task has no nextPollAt.")
+                if due > now:
+                    return None
+            else:
+                row = conn.execute("SELECT * FROM tasks WHERE status='queued' ORDER BY started_at IS NULL,started_at,queued_at,id LIMIT 1").fetchone()
+                if row is None:
+                    return None
+                task = self.decode(row)
+                if task.get("legacy"):
+                    raise WorkerError("LEGACY_ACTIVE_TASK", "A historical task cannot be executed by the plugin runtime.")
+            task.update(status="running", updatedAt=now, startedAt=task.get("startedAt") or now,
+                        revision=task["revision"] + 1)
+            return self._write(conn, task)
+
+    def delete(self, id, expectedRevision):
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status,plugin_revision FROM tasks WHERE id=?", (id,)).fetchone()
+            if row is None:
+                raise WorkerError("TASK_NOT_FOUND", "Task not found.")
+            if row["plugin_revision"] != expectedRevision:
+                raise WorkerError("REVISION_CONFLICT", "Task revision changed.")
+            if row["status"] not in TERMINAL:
+                raise WorkerError("TASK_BUSY", "Active tasks cannot be deleted.")
+            conn.execute("DELETE FROM tasks WHERE id=?", (id,))
+        return None
+
+    def _workflow(self, row):
+        if row is None:
+            raise WorkerError("WORKFLOW_DOCUMENT_NOT_FOUND", "Workflow document not found.")
+        return {"id": row["id"], "revision": row["revision"], "document": json.loads(row["document_json"]),
+                "createdAt": row["created_at"], "updatedAt": row["updated_at"]}
+
+    def workflow_list(self, limit=100, offset=0):
+        if type(limit) is not int or not 1 <= limit <= 1000 or type(offset) is not int or offset < 0:
+            raise WorkerError("INVALID_QUERY", "Invalid workflow pagination.")
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM workflow_documents ORDER BY updated_at DESC,id LIMIT ? OFFSET ?",
+                                (limit + 1, offset)).fetchall()
+            return {"items": [self._workflow(row) for row in rows[:limit]], "limit": limit, "offset": offset,
+                    "hasMore": len(rows) > limit}
+
+    def workflow_get(self, id):
+        with self.connect() as conn:
+            return self._workflow(conn.execute("SELECT * FROM workflow_documents WHERE id=?", (id,)).fetchone())
+
+    def workflow_create(self, document):
+        from backend.app.paths import now_iso
+        if not isinstance(document, dict) or not isinstance(document.get("id"), str) or not document["id"]:
+            raise WorkerError("INVALID_CONFIG", "Workflow document must have an ID.")
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM workflow_documents WHERE id=?", (document["id"],)).fetchone():
+                raise WorkerError("WORKFLOW_DOCUMENT_EXISTS", "Workflow document already exists.")
+            conn.execute("INSERT INTO workflow_documents VALUES(?,1,?,?,?)",
+                         (document["id"], serialized(document), timestamp, timestamp))
+            return self._workflow(conn.execute("SELECT * FROM workflow_documents WHERE id=?", (document["id"],)).fetchone())
+
+    def workflow_update(self, id, document, expectedRevision):
+        from backend.app.paths import now_iso
+        if not isinstance(document, dict) or document.get("id") != id:
+            raise WorkerError("INVALID_CONFIG", "Workflow document ID cannot change.")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            previous = self._workflow(conn.execute("SELECT * FROM workflow_documents WHERE id=?", (id,)).fetchone())
+            if type(expectedRevision) is not int or previous["revision"] != expectedRevision:
+                raise WorkerError("REVISION_CONFLICT", "Workflow document changed. Keep your draft and reload the saved version.")
+            conn.execute("UPDATE workflow_documents SET revision=revision+1,document_json=?,updated_at=? WHERE id=?",
+                         (serialized(document), now_iso(), id))
+            return self._workflow(conn.execute("SELECT * FROM workflow_documents WHERE id=?", (id,)).fetchone())
+
+    def workflow_migrate_defaults(self, document, expectedDefaults):
+        """Commit the preference workflow and completion marker together, once."""
+        from backend.app.paths import now_iso
+        key = "plugin:youdub.localize"
+        if not isinstance(document, dict) or document.get("id") != "user.legacy-defaults-v1":
+            raise WorkerError("INVALID_CONFIG", "Invalid migrated workflow ID.")
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
+            plugin = json.loads(row[0]) if row else {}
+            if not isinstance(plugin, dict):
+                raise WorkerError("INVALID_CONFIG", "Stored localization settings are not an object.")
+            previous = plugin.get("defaultsMigration") or {}
+            if previous.get("version") == 1 and previous.get("status") == "complete":
+                return previous
+            row = conn.execute("SELECT value_json FROM settings WHERE key='defaults'").fetchone()
+            if not row or json.loads(row[0]) != expectedDefaults:
+                raise WorkerError("REVISION_CONFLICT", "Saved processing preferences changed during migration.")
+            if conn.execute("SELECT 1 FROM workflow_documents WHERE id=?", (document["id"],)).fetchone():
+                raise WorkerError("WORKFLOW_DOCUMENT_EXISTS", "The migration workflow ID is already in use; existing work was preserved.")
+            conn.execute("INSERT INTO workflow_documents VALUES(?,1,?,?,?)",
+                         (document["id"], serialized(document), timestamp, timestamp))
+            state = {"version": 1, "status": "complete", "documentId": document["id"], "revision": 1}
+            plugin["defaultsMigration"] = state
+            conn.execute("INSERT INTO settings VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                         (key, serialized(plugin), timestamp))
+            return state
+
+    def workflow_delete(self, id, expectedRevision):
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            previous = self._workflow(conn.execute("SELECT * FROM workflow_documents WHERE id=?", (id,)).fetchone())
+            if type(expectedRevision) is not int or previous["revision"] != expectedRevision:
+                raise WorkerError("REVISION_CONFLICT", "Workflow document changed.")
+            conn.execute("DELETE FROM workflow_documents WHERE id=?", (id,))
+        return None
+
+    def settings_values(self):
+        with self.connect() as conn:
+            return {row["key"]: json.loads(row["value_json"]) for row in conn.execute("SELECT key,value_json FROM settings")}
+
+    def migrate_connection_model(self):
+        from backend.app.paths import now_iso
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            values = {row["key"]: json.loads(row["value_json"]) for row in conn.execute("SELECT key,value_json FROM settings WHERE key IN ('defaults','connections')")}
+            defaults = values.get("defaults")
+            selection = defaults.get("translation") if isinstance(defaults, dict) else None
+            model = selection.get("model") if isinstance(selection, dict) else None
+            if not isinstance(model, str) or not model.strip():
+                return
+            connections = values.get("connections", [])
+            changed = False
+            for connection in connections:
+                if connection["adapter"] == selection.get("adapter") and "model" not in connection:
+                    connection["model"] = model
+                    changed = True
+            if changed:
+                conn.execute("UPDATE settings SET value_json=?,updated_at=? WHERE key='connections'",
+                             (serialized(connections), now_iso()))
+
+    def write_setting(self, key, value):
+        from backend.app.paths import now_iso
+        with self.connect() as conn:
+            conn.execute("INSERT INTO settings VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                         (key, serialized(value), now_iso()))

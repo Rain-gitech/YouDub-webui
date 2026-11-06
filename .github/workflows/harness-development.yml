@@ -1,0 +1,247 @@
+name: YouDub Desktop 源码开发检查
+
+on:
+  pull_request:
+    branches: [main]
+    types: [ready_for_review]
+  workflow_dispatch:
+    inputs:
+      package_desktop:
+        description: 构建桌面安装包并运行安装验收
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harness-development-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: 前端质量与安全
+    needs: source-development
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 确认框架、界面和业务回归通过
+        env:
+          MACOS_RESULT: ${{ needs.source-development.result }}
+        run: test "$MACOS_RESULT" = success
+
+  backend:
+    name: Host 与 Python 测试
+    needs: [source-development, source-development-windows]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 确认双平台 Host 与 Python 回归通过
+        env:
+          MACOS_RESULT: ${{ needs.source-development.result }}
+          WINDOWS_RESULT: ${{ needs.source-development-windows.result }}
+        run: |
+          test "$MACOS_RESULT" = success
+          test "$WINDOWS_RESULT" = success
+
+  source-development:
+    name: macOS 源码、框架与业务回归
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      LEFTHOOK: "0"
+      ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/harness/package-lock.json
+            apps/web/package-lock.json
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: 读取产品框架源码范围
+        run: |
+          node apps/harness/framework-source.mjs
+      - name: 安装源码开发依赖
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmmirror.com
+          npm --prefix apps/harness ci --no-audit --no-fund --registry=https://registry.npmmirror.com
+          npm --prefix apps/web ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmmirror.com
+          python -m venv .venv
+          .venv/bin/python -m pip install --index-url https://mirrors.aliyun.com/pypi/simple/ -r backend/requirements/base.txt -r backend/requirements-test.txt
+          .venv/bin/python -m nltk.downloader -e -d "$GITHUB_WORKSPACE/.cache/nltk_data" punkt_tab
+          echo "NLTK_DATA=$GITHUB_WORKSPACE/.cache/nltk_data" >> "$GITHUB_ENV"
+          brew install ffmpeg-full
+          echo "$(brew --prefix ffmpeg-full)/bin" >> "$GITHUB_PATH"
+      - name: 从仓库源码构建框架与 YouDub
+        run: |
+          npm run build:framework
+          npm run build:youdub
+          npm --prefix apps/harness run check:composition
+      - name: 检查保留的桌面、界面和插件生命周期
+        working-directory: .cache/harness/source-build
+        env:
+          npm_execpath: ${{ github.workspace }}/apps/harness/node_modules/pnpm/bin/pnpm.mjs
+        run: node --import ../../../apps/harness/test/source-framework.mjs node_modules/vitest/vitest.mjs run apps/desktop/tests apps/desktop-host/tests/quit-inspection.spec.ts packages/client packages/host packages/api/remotes packages/api/settings-controller/tests/credentials-controller.host.spec.ts packages/boot/app-boot/tests packages/boot/plugin-manager/tests
+      - name: 检查领域、界面和语言
+        run: |
+          npm run typecheck
+          npm test
+          npm run test:downloads
+          npm --prefix apps/web test
+          apps/web/node_modules/.bin/tsc --noEmit -p apps/web/tsconfig.json
+          npm --prefix apps/harness run check:locales
+      - name: 检查 Harness 集成和媒体合同
+        run: |
+          npm --prefix apps/harness test
+          .venv/bin/python -m pytest backend/tests
+      - name: 打包并验证独立 macOS 应用
+        if: github.event_name == 'workflow_dispatch' && inputs.package_desktop
+        env:
+          # The candidate uses identity "-" (ad-hoc); Apple credentials only exist in the release job.
+          CSC_FOR_PULL_REQUEST: "true"
+        run: |
+          npm run package:desktop -- --dir
+          node apps/harness/test/package-smoke.mjs dist/mac-arm64/YouDub.app dist/package-smoke-mac
+          node apps/harness/test/package-smoke.mjs dist/mac-arm64/YouDub.app dist/package-smoke-mac-workbench --workbench
+          tar -czf dist/youdub-macos-unsigned.tar.gz -C dist/mac-arm64 YouDub.app
+      - name: 保存 macOS 候选包与首启证据
+        if: github.event_name == 'workflow_dispatch' && inputs.package_desktop
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: youdub-macos-unsigned
+          path: |
+            dist/youdub-macos-unsigned.tar.gz
+            dist/package-smoke-mac/
+            dist/package-smoke-mac-workbench/
+          if-no-files-found: error
+      - name: 保存源码构建证据
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: youdub-source-build-evidence
+          path: |
+            .cache/harness/source-build/youdub-source-build.json
+            apps/harness/dist/build-inputs.json
+            apps/harness/dist/desktop/build-inputs.json
+          if-no-files-found: error
+
+  source-development-windows:
+    name: Windows 源码、Host 与桌面合同
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      LEFTHOOK: "0"
+      ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+    steps:
+      - name: 保持源码字节与链接
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+          git config --global core.symlinks true
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/harness/package-lock.json
+            apps/web/package-lock.json
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: 读取产品框架源码范围
+        run: |
+          node apps/harness/framework-source.mjs
+      - name: 安装源码与 Host 测试依赖
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmmirror.com
+          npm --prefix apps/harness ci --no-audit --no-fund --registry=https://registry.npmmirror.com
+          npm --prefix apps/web ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmmirror.com
+          python -m venv .venv
+          .venv/Scripts/python.exe -m pip install --index-url https://mirrors.aliyun.com/pypi/simple/ -r backend/requirements/base.txt
+          echo "YOUDUB_TEST_PYTHON=$GITHUB_WORKSPACE/.venv/Scripts/python.exe" >> "$GITHUB_ENV"
+      - name: 从仓库源码构建 Windows 开发版
+        run: |
+          npm run build:framework
+          npm run build:youdub
+          npm --prefix apps/harness run check:composition
+      - name: 检查 Windows 桌面与进程生命周期
+        working-directory: .cache/harness/source-build
+        env:
+          npm_execpath: ${{ github.workspace }}/apps/harness/node_modules/pnpm/bin/pnpm.mjs
+        run: |
+          node --import ../../../apps/harness/test/source-framework.mjs node_modules/vitest/vitest.mjs run apps/desktop/tests apps/desktop-host/tests/quit-inspection.spec.ts packages/subprocess/subprocess-local/tests packages/boot/plugin-manager/tests/operations.spec.ts packages/boot/plugin-manager/tests/operations-process.spec.ts
+      - name: 运行实际 Electron Host 与产品合同
+        run: |
+          node -e "require('./apps/harness/node_modules/electron')"
+          node --import ./apps/harness/test/source-framework.mjs --test apps/harness/test/desktop-host-composition.test.mjs apps/harness/test/desktop-activity.test.mjs apps/harness/test/desktop-unload.test.mjs apps/harness/test/profile.test.mjs apps/harness/test/setup-onboarding.test.mjs apps/harness/test/worker-media-paths.test.mjs
+          node --import tsx --test packages/builtin/test/media-paths.test.ts packages/builtin/test/setup.test.ts
+          npm run typecheck
+          npm --prefix apps/harness run check:locales
+      - name: 打包并验证独立 Windows 应用
+        if: github.event_name == 'workflow_dispatch' && inputs.package_desktop
+        run: |
+          npm run package:desktop -- --dir
+          node apps/harness/test/package-smoke.mjs dist/win-unpacked dist/package-smoke-windows
+          node apps/harness/test/package-smoke.mjs dist/win-unpacked dist/package-smoke-windows-workbench --workbench
+          npm run package:desktop -- --installers-only
+          node apps/harness/test/installer-smoke.mjs
+          curl --fail --location --output dist/previous-YouDub-0.0.9-Setup.exe https://github.com/liuzhao1225/YouDub-webui/releases/download/v0.0.9/YouDub-0.0.9-windows-x64-Setup.exe
+          echo '6ebc698bf49b3107280f17b8368c117aaee4671edaf6dfd9c24b53c443ad7c34  dist/previous-YouDub-0.0.9-Setup.exe' | sha256sum --check
+          node apps/harness/test/installer-smoke.mjs --previous-installer=dist/previous-YouDub-0.0.9-Setup.exe
+          cd dist
+          for file in YouDub-*.exe YouDub-*.zip; do
+            sha256sum "$file" > "$file.sha256"
+            sha256sum --check "$file.sha256"
+          done
+      - name: 保存 Windows 安装失败诊断
+        if: failure() && github.event_name == 'workflow_dispatch' && inputs.package_desktop
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: youdub-windows-install-failure
+          path: |
+            dist/package-smoke-windows/
+            dist/package-smoke-windows-workbench/
+            dist/package-smoke-windows-installed/
+            dist/package-smoke-windows-previous-upgrade/
+          if-no-files-found: warn
+      - name: 保存 Windows 安装包与首启证据
+        if: github.event_name == 'workflow_dispatch' && inputs.package_desktop
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: youdub-windows-release
+          path: |
+            dist/YouDub-*.exe
+            dist/YouDub-*.zip
+            dist/YouDub-*.sha256
+            dist/package-smoke-windows/
+            dist/package-smoke-windows-workbench/
+            dist/package-smoke-windows-installed/
+            dist/package-smoke-windows-previous-upgrade/
+          if-no-files-found: error
+      - name: 保存 Windows 源码构建证据
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: youdub-windows-source-build-evidence
+          path: |
+            .cache/harness/source-build/youdub-source-build.json
+            apps/harness/dist/build-inputs.json
+            apps/harness/dist/desktop/build-inputs.json
+          if-no-files-found: error

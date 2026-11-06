@@ -1,0 +1,120 @@
+"""Generate a Task's speech clips with one local VoxCPM2 model instance."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import traceback
+from time import monotonic
+from contextlib import contextmanager
+from pathlib import Path
+
+
+@contextmanager
+def initialization_dtype():
+    """Scope low-memory model construction to this isolated inference process."""
+    import torch
+    configured = os.getenv("VOXCPM_INIT_DTYPE", "").strip()
+    if not configured:
+        yield
+        return
+    if configured not in {"float32", "float16", "bfloat16"}:
+        raise ValueError("Unsupported VOXCPM_INIT_DTYPE")
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(getattr(torch, configured))
+        yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
+def _fail(code: str, message: str) -> int:
+    print(json.dumps({"code": code, "message": message}), file=sys.stderr)
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", type=Path, required=True)
+    parser.add_argument("--request-path", type=Path, required=True)
+    parser.add_argument("--device", required=True)
+    options = parser.parse_args(argv)
+    model_path = options.model_path.resolve()
+    if not model_path.is_dir():
+        return _fail("MODEL_NOT_READY", "The local VoxCPM2 model directory is missing.")
+    try:
+        config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+        architecture = str(config.get("architecture", "")).lower()
+        if architecture not in {"voxcpm", "voxcpm2"}:
+            raise ValueError("VoxCPM architecture is required")
+    except (OSError, ValueError, AttributeError):
+        return _fail("MODEL_NOT_READY", "The selected model is not a valid local VoxCPM2 model.")
+    try:
+        request = json.loads(options.request_path.read_text(encoding="utf-8"))
+        clips = request['clips']
+        if not isinstance(clips, list) or not clips:
+            raise ValueError("Speech clips are required")
+        ids = set()
+        for clip in clips:
+            if not isinstance(clip["text"], str) or not clip["text"].strip() or clip["segment_id"] in ids:
+                raise ValueError("Invalid speech clip")
+            ids.add(clip["segment_id"])
+            if not Path(clip["reference_path"]).is_file():
+                raise ValueError("Reference audio is missing")
+            if not isinstance(clip["reference_text"], str) or not clip["reference_text"].strip():
+                raise ValueError("Reference audio transcript is missing")
+    except (OSError, ValueError, KeyError, TypeError):
+        return _fail("INPUT_MISSING", "The speech generation request or reference audio is invalid.")
+
+    # VoxCPM's tokenizer loader also stays offline when resolving optional files.
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    from backend.app.config import configure_windows_ffmpeg_dll_directory
+    configure_windows_ffmpeg_dll_directory()
+    try:
+        import numpy as np
+        import soundfile as sf
+        from voxcpm import VoxCPM
+    except ImportError:
+        return _fail("MODEL_NOT_READY", "Install VoxCPM2 and its audio dependencies in the backend environment.")
+    try:
+        with initialization_dtype():
+            model = VoxCPM.from_pretrained(
+                str(model_path), local_files_only=True, load_denoiser=False, optimize=False, device=options.device,
+            )
+        sample_rate = getattr(model.tts_model, "sample_rate", None)
+        if sample_rate is None:
+            sample_rate = model.tts_model.config.sample_rate
+        if type(sample_rate) is not int or sample_rate <= 0:
+            raise ValueError("Invalid model output sample rate")
+    except Exception as exc:
+        traceback.print_exc()
+        return _fail("MODEL_NOT_READY", f"The local VoxCPM2 model could not be loaded ({type(exc).__name__}).")
+    try:
+        from backend.app.v1.personal_progress import write_progress
+        progress_path = Path(request['progress_path']) if request.get('progress_path') else None
+        started = monotonic()
+        for index, clip in enumerate(clips, 1):
+            reference = {} if architecture == "voxcpm" else {"reference_wav_path": clip["reference_path"]}
+            waveform = np.asarray(model.generate(
+                text=clip["text"], **reference,
+                prompt_wav_path=clip["reference_path"], prompt_text=clip["reference_text"],
+                normalize=False, denoise=False, retry_badcase=False,
+            ))
+            if (waveform.ndim != 1 or waveform.size == 0 or not np.isfinite(waveform).all()
+                    or np.max(np.abs(waveform)) > 1):
+                raise ValueError("VoxCPM2 returned an empty or invalid mono waveform")
+            sf.write(clip["output_path"], waveform, sample_rate, format="WAV", subtype="PCM_16")
+            speed = index / max(.001, monotonic() - started)
+            eta = int((len(clips) - index) / speed)
+            write_progress(progress_path, index / len(clips), f'Generated {index}/{len(clips)} clips · {speed:.2f} clips/s · ETA {eta // 60:02d}:{eta % 60:02d}')
+    except Exception as exc:
+        traceback.print_exc()
+        return _fail("INVALID_PROVIDER_RESULT", f"VoxCPM2 speech generation failed ({type(exc).__name__}).")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

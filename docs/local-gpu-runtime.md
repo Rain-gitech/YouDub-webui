@@ -113,3 +113,6 @@ CUDA 上下文/驱动占用不包含在此值中。
 为不打断 2026-11-05 正在运行的旧 GPU 队列，本次临时启用了 8001 端口的接口服务（`YOUDUB_API_ONLY=true`），以及 `data/launcher/publication-backfill.pid` 对应的补齐进程。接口服务不重置任务、不启动 GPU worker。相关日志与 PID 均在 `data/launcher/publication-*`。
 
 正常启动脚本强制将发布接口转回 8000，并禁用 API-only 模式；更新后的主后端在翻译阶段自动生成发布资料，因此正常启动无需额外服务。若手工启动前端，注意 `apps/web/.env.local` 中的 `NEXT_SERVER_PUBLICATION_API_BASE_URL` 是本次临时部署值，可删除该变量以使用主后端。不要在队列运行中停止主后端。
+# Classic runtime only
+
+This document describes the preserved Next.js/FastAPI edition at commit `543f3fb`. For the integrated v0.0.12 Harness edition, use [personal-upstream.md](personal-upstream.md) and `scripts/start-personal.py`.

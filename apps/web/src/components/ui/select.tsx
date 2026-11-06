@@ -1,90 +1,27 @@
-"use client"
+import { Children, createContext, isValidElement, useContext, useState, type ComponentProps, type ReactNode } from 'react'
+import { IconChevronDown } from '@tabler/icons-react'
+import { Button, Menu } from './harness-primitives'
+import { childrenItems, layoutClasses } from './menu-options'
+import { cn } from '@/lib/utils'
 
-import * as React from "react"
-import { Select as SelectPrimitive } from "@base-ui/react/select"
-import { Check, ChevronDown } from "lucide-react"
+const SelectContext = createContext<{ open: boolean; setOpen: (open: boolean) => void } | null>(null)
+type Props = { children: ReactNode; value: string; onValueChange: (value: string) => void }
 
-import { cn } from "@/lib/utils"
-
-function Select({ ...props }: SelectPrimitive.Root.Props<string>) {
-  return <SelectPrimitive.Root data-slot="select" {...props} />
+export function Select({ children, value, onValueChange }: Props) {
+  const [open, setOpen] = useState(false)
+  const parts = Children.toArray(children).filter(isValidElement<{ children?: ReactNode; className?: string }>)
+  const trigger = parts.find(child => child.type === SelectTrigger)
+  const content = parts.find(child => child.type === SelectContent)
+  return <SelectContext.Provider value={{ open, setOpen }}><Menu open={open} portal autoFocus items={childrenItems(content?.props.children)} selectedId={value} onClose={() => setOpen(false)} onSelect={next => {
+    onValueChange(next); setOpen(false)
+  }} anchor={trigger} className={cn('yd-select w-full', layoutClasses(trigger?.props.className))} /></SelectContext.Provider>
 }
-
-function SelectTrigger({
-  className,
-  children,
-  ...props
-}: SelectPrimitive.Trigger.Props) {
-  return (
-    <SelectPrimitive.Trigger
-      data-slot="select-trigger"
-      className={cn(
-        "flex h-8 w-full items-center justify-between gap-2 rounded-lg border border-input bg-transparent px-2.5 py-1 text-sm transition-colors outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:cursor-not-allowed disabled:bg-input/50 disabled:opacity-50 data-placeholder:text-muted-foreground",
-        className
-      )}
-      {...props}
-    >
-      {children}
-      <SelectPrimitive.Icon className="text-muted-foreground">
-        <ChevronDown className="size-4" />
-      </SelectPrimitive.Icon>
-    </SelectPrimitive.Trigger>
-  )
+export function SelectTrigger({ children, className, ...props }: ComponentProps<typeof Button>) {
+  const state = useContext(SelectContext)
+  if (!state) throw new Error('SelectTrigger requires Select')
+  return <Button {...props} className={cn('w-full min-w-0 justify-between gap-2 [&_svg]:size-4 [&_svg]:shrink-0', className)} type="button" variant="outline" aria-haspopup="menu" aria-expanded={state.open} onClick={() => state.setOpen(!state.open)} onKeyDown={event => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); state.setOpen(true) }
+  }}>{children}<IconChevronDown aria-hidden="true" /></Button>
 }
-
-function SelectValue({ ...props }: SelectPrimitive.Value.Props) {
-  return <SelectPrimitive.Value data-slot="select-value" {...props} />
-}
-
-function SelectContent({
-  className,
-  children,
-  ...props
-}: SelectPrimitive.Popup.Props) {
-  return (
-    <SelectPrimitive.Portal>
-      <SelectPrimitive.Positioner alignItemWithTrigger={false} sideOffset={6} className="z-[60]">
-        <SelectPrimitive.Popup
-          data-slot="select-content"
-          className={cn(
-            "max-h-72 min-w-64 overflow-hidden rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg outline-none",
-            className
-          )}
-          {...props}
-        >
-          <SelectPrimitive.List className="max-h-64 overflow-y-auto">{children}</SelectPrimitive.List>
-        </SelectPrimitive.Popup>
-      </SelectPrimitive.Positioner>
-    </SelectPrimitive.Portal>
-  )
-}
-
-function SelectItem({
-  className,
-  children,
-  ...props
-}: SelectPrimitive.Item.Props) {
-  return (
-    <SelectPrimitive.Item
-      data-slot="select-item"
-      className={cn(
-        "relative flex cursor-default items-center rounded-md py-1.5 pr-2 pl-8 text-sm outline-none select-none data-disabled:pointer-events-none data-disabled:opacity-50 data-highlighted:bg-accent data-highlighted:text-accent-foreground",
-        className
-      )}
-      {...props}
-    >
-      <SelectPrimitive.ItemIndicator className="absolute left-2 flex size-4 items-center justify-center text-primary">
-        <Check className="size-4" />
-      </SelectPrimitive.ItemIndicator>
-      <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
-    </SelectPrimitive.Item>
-  )
-}
-
-export {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-}
+export function SelectContent({ children }: { children: ReactNode }) { return children }
+export function SelectItem({ children }: { children: ReactNode; value: string; disabled?: boolean }) { return children }

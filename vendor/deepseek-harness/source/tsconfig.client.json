@@ -1,0 +1,107 @@
+{
+  "extends": "./tsconfig.base.client.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rewriteRelativeImportExtensions": false,
+    "types": [
+      "node"
+    ]
+  },
+  "include": [
+    "apps/desktop/tests/keyboard.spec.ts",
+    "apps/desktop/src/keyboard.ts",
+    "apps/desktop/src/keybindings.ts",
+    "apps/desktop/src/ipc.ts",
+    "apps/desktop/tests/**/*.client.spec.tsx",
+    "packages/client/*/src/css-modules.d.ts",
+    "packages/client/*/tests/**/*.ts",
+    "packages/client/*/tests/**/*.tsx",
+    "packages/*/*/tests/**/*.client.spec.ts",
+    "packages/*/*/tests/**/*.client.spec.tsx",
+    "packages/*/*/tests/**/*.client.tsx",
+    "packages/*/*/tests/**/*.client.ts",
+    "packages/client/tsdown.client.ts",
+    "scripts/client-build-environment.ts",
+    "scripts/bundle-input-isolation.ts",
+    "scripts/experimental-package-policy.ts",
+    "scripts/*.client.spec.ts",
+    "scripts/client-bundle-css.spec.ts",
+    "scripts/client-bundle-purity.spec.ts"
+  ],
+  "exclude": [
+    "packages/client/*/tests/**/*.host.spec.ts",
+    "packages/client/*/tests/**/*.host.e2e.ts",
+    "packages/client/*/tests/**/*.host.ts"
+  ],
+  "references": [
+    {
+      "path": "./packages/util/atomic-write"
+    },
+    {
+      "path": "./packages/host/webserver"
+    },
+    {
+      "path": "./packages/client/store"
+    },
+    {
+      "path": "./packages/client/ui-slots"
+    },
+    {
+      "path": "./packages/client/ui-primitives"
+    },
+    {
+      "path": "./packages/client/modules"
+    },
+    {
+      "path": "./packages/client/hmr"
+    },
+    {
+      "path": "./packages/client/connection/tsconfig.client.json"
+    },
+    {
+      "path": "./packages/typert/registry"
+    },
+    {
+      "path": "./packages/api/gateway/tsconfig.client.json"
+    },
+    {
+      "path": "./packages/api/remotes/tsconfig.client.json"
+    },
+    {
+      "path": "./packages/client/shortcuts/tsconfig.client.json"
+    },
+    {
+      "path": "./packages/client/ui-layout"
+    },
+    {
+      "path": "./packages/client/ui-sidebar"
+    },
+    {
+      "path": "./packages/client/ui-theme/tsconfig.client.json"
+    },
+    {
+      "path": "./packages/client/ui-settings/tsconfig.client.json"
+    },
+    {
+      "path": "./packages/client/ui-settings-general/tsconfig.client.json"
+    },
+    {
+      "path": "./packages/client/ui-settings-models"
+    },
+    {
+      "path": "./packages/client/ui-plugin-manager/tsconfig.client.json"
+    },
+    {
+      "path": "./packages/client/locale/tsconfig.client.json"
+    },
+    {
+      "path": "./packages/client/ui-renderer"
+    },
+    {
+      "path": "./packages/client/web"
+    },
+    {
+      "path": "./apps/web"
+    }
+  ]
+}

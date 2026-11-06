@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start-local-gpu.ps1"
+"%~dp0.venv-personal\Scripts\python.exe" "%~dp0scripts\start-personal.py"
 if errorlevel 1 pause

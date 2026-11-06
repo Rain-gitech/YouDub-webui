@@ -1,36 +1,12 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# YouDub 业务组件与测试
 
-## Getting Started
+本目录保留 YouDub 页面、动态 Logo、动画、画布、校对组件和领域测试。桌面由 Harness Renderer、ModuleLoader、Slots、Store 和共享 React 承载；控件与服务接线位于 `apps/harness/src/frontend`。
 
-First, run the development server:
+产品构建使用根目录 `npm run build:youdub`，Electron 启动使用 `npm start`。`npm run dev:web` 启动同一 Harness Host 的浏览器开发入口。原独立 Vite 页面、浏览器 Context 引导和插件 import-map 构建已移除。
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+- `src/plugin/builtin/`：工作台、任务库、工作流、画布和任务校对组件。
+- `src/components/`：业务组件；通用控件在产品构建中接入 Harness 实现。
+- `src/locales/`：中文、英文、日语业务文案。
+- `src/plugin/sdk.tsx`：保留组件及领域测试使用的合同，产品接入由 Harness 侧负责。
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+在本目录执行 `npm test`、`npm run typecheck` 和 `npm run lint`。修改当前产品请阅读[前端开发说明](../harness/docs/FRONTEND-DEVELOPMENT.md)与[本地运行](../harness/docs/DEVELOPMENT.md)。

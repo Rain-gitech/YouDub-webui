@@ -1,0 +1,29 @@
+import { describe, expect, it, vi } from 'vitest'
+import {
+  Win32Error,
+  isNullPtr,
+  throwLastError,
+} from '../src/index.ts'
+import { errorText } from '../src/ffi.ts'
+import type { NativePtr, Win32ProcessBindings } from '../src/index.ts'
+
+describe('shared Win32 process ABI', () => {
+  it('recognizes NULL process handles', () => {
+    expect(isNullPtr(0n as NativePtr)).toBe(true)
+    expect(isNullPtr(1n as NativePtr)).toBe(false)
+  })
+
+  it('formats and throws the exact Win32 error', () => {
+    const api = {
+      getLastError: vi.fn(() => 5),
+      formatMessageW: vi.fn((_flags, _source, _id, _language, buffer: Buffer) => {
+        buffer.write('access denied', 'utf16le')
+        return 'access denied'.length
+      }),
+    } as unknown as Win32ProcessBindings
+    expect(errorText(api, 5)).toBe('access denied')
+    expect(() => throwLastError(api, 'Probe')).toThrow(Win32Error)
+    expect(new Win32Error('CloseHandle', 6).message).toBe('CloseHandle failed (Win32 6)')
+  })
+
+})
